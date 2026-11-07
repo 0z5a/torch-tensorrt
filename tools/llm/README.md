@@ -567,9 +567,65 @@ python run_llm.py --model meta-llama/Llama-3.1-8B --quant_format fp8 --prompt "W
 ### Caching Strategies
 
 - **Static Cache v1/v2:** Adds static KV cache tensors as model inputs/outputs for efficient reuse.
+- **Static Cache v3** (`static_cache_v3.py`): a shape-static, single-token decode engine for batch 1.
+  v1/v2 slice the cache to the current length, so TensorRT synchronizes with the host twice per
+  layer and step and the engine cannot be captured in a CUDA graph. v3 writes the new key and value
+  in place (`index_copy`, lowered to `IKVCacheUpdateLayer`) and attends over the whole cache with a
+  position mask and native grouped-query attention. Prefill runs one token at a time. Used by the
+  agentic decode workload below.
 - **No Cache:** Standard autoregressive decoding.
 
 Please read our tutorial on how static cache is implemented.
+
+### Agentic decode optimization
+
+`run_agentic_decode.py` runs a `torch_tensorrt.agentic` optimization session on batch-1 decode
+(see the `torch_tensorrt.agentic` documentation). The workload (`agentic_decode.py`) measures
+milliseconds per decoded token; decoding is teacher-forced on a fixed public-domain text, and every
+step's logits are checked against an FP32 eager reference (top-1 agreement >= 0.97 and mean KL
+divergence <= 0.005 by default). The session starts from the documented configuration (FP16,
+`static_v2`) and searches the KV cache lowering, precision, FP32 accumulation, builder levels and
+runtime modes, one validated change at a time.
+
+```bash
+python run_agentic_decode.py --session /tmp/qwen3-decode --max-trials 8
+python run_agentic_decode.py --session /tmp/qwen3-decode-agent --max-trials 8 --planner agent
+python -m torch_tensorrt.agentic status /tmp/qwen3-decode
+```
+
+Each trial runs in a fresh process; rerunning a command resumes its session. The session
+directory holds every trial's evidence, the report (`report.md`) and the exported decode engine
+(`artifact/decode.ep` with its `recipe.json`).
+
+#### Results: Qwen3-0.6B decode on an RTX 5090
+
+Batch 1, 128 prompt tokens, 64 decoded tokens per measured call; TensorRT 11.4, Torch-TensorRT
+Python runtime, driver 610.57, a GPU shared with another process. Both sessions started from the
+documented configuration (FP16, `static_v2`) and checked every candidate against FP32 eager logits.
+
+| Session | Planner | Trials | Baseline | Best | Confirmed gain | Best recipe |
+|---|---|---|---|---|---|---|
+| A | heuristic | 10 | 2.922 ms/token | 1.251 ms/token | +56.9% (2.34x tokens/s) | `static_v3`, `use_fp32_acc=False` |
+| B | agent (`claude`) | 6, then the agent stopped | 2.923 ms/token | 1.235 ms/token | +57.1% (2.37x tokens/s) | `static_v3`, CUDA graphs, `use_fp32_acc=False` |
+
+Top-1 agreement stayed 1.0 (mean KL 1.9e-5 to 4.5e-5) and process GPU memory fell from 2160 MB
+to about 2040 MB. "Confirmed" is the median of two fresh baseline/best worker pairs.
+
+What the sessions measured:
+
+- The baseline spends 31% of each token waiting on the host: `static_v2` makes TensorRT copy
+  data-dependent sizes to the host twice per layer and step (58 device-to-host copies per token).
+  Both planners chose `static_v3` first (about 1.38-1.41 ms/token, no host copies).
+- Turning off FP32 accumulation for FP16 matrix multiplications gained another 9-12% within the
+  accuracy bounds.
+- No gain beyond noise: CUDA graphs (decode is GPU-bound after `static_v3`), pre-allocated outputs,
+  builder optimization levels 4 and 5. Slower: BF16 (8-21%), FP32 (50%). TensorRT 11.4 failed to
+  build the engine with tiling optimization (`moderate`, `fast`); the sessions recorded the error.
+- About 70% of the remaining GPU time is cuBLAS GEMV over FP16 weights, which is memory-bound:
+  weight quantization (ModelOpt) is the next lever.
+- The exported `decode.ep` reloads in a fresh process with the same accuracy. Called through
+  `torch_tensorrt.load(...).module()` it decoded at 1.50 ms/token, 0.25 ms more than in the
+  session, because the loaded program checks its 58 inputs on every call.
 
 ## Extension
 
