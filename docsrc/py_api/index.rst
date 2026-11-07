@@ -14,6 +14,7 @@ Core
    logging
    runtime
    region
+   agentic
    kernels
    executorch
    ../cli/torchtrtc

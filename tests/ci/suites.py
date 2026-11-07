@@ -189,6 +189,15 @@ _L0: list[Suite] = [
         jobs=_HEAVY,
     ),
     Suite(
+        # Optimization sessions: controller logic on a CPU fake workload, plus
+        # worker processes and small TensorRT candidates on the GPU.
+        "dynamo-agentic",
+        tier="l0",
+        lanes=("fast", "full", "nightly", "python-only"),
+        paths=("agentic/",),
+        jobs="4",
+    ),
+    Suite(
         "py-core",
         tier="l0",
         lanes=("fast", "full", "nightly"),
