@@ -256,10 +256,14 @@ zero-copy views of a safetensors file:
 - **Missing names** raise for any name in the model's ``state_dict``; non-persistent buffers, such as
   rotary frequencies, aren't required, so recompute those or write them with
   ``save_weights_for_mapping``. With ``strict=False``, missing names are listed in ``mapping.missing``
-  and left as they were (still on ``meta`` if the model was built there). On any error the model is left
-  unchanged.
+  and left as they were. A missing tensor on ``meta`` stays there, with no values, and a warning names
+  it. On any error the model is left unchanged.
 - **The file must stay in place and unchanged** while the model or its weights are in use: rewriting it
   changes or invalidates the weights. ``map_weights`` maps it copy-on-write and never writes to it.
+  Weights are read when compilation first uses them, so ``compile`` checks that the file of each mapped
+  weight the program reads is still the one mapped (same inode, size and modification time) and raises
+  otherwise; reading a weight past the end of a file truncated since would kill the process with
+  ``SIGBUS``.
 - **Releasing pages uses** ``madvise``: ``MADV_PAGEOUT`` on Linux 5.4 and later, which keeps writes made
   to a weight, else ``MADV_DONTNEED``, which discards them, so the weight reverts to the file's data. On
   Windows the mapping works, but pages stay resident until the file is unmapped, and a warning says so.
