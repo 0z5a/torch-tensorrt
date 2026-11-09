@@ -577,6 +577,46 @@ python run_llm.py --model meta-llama/Llama-3.1-8B --quant_format fp8 --prompt "W
 
 Please read our tutorial on how static cache is implemented.
 
+### Fused decoder-block kernels (Qwen3)
+
+`qwen3_regions.py` runs whole Qwen3 decoder blocks as fused Triton kernels inside the
+TensorRT decode engine, through `torch_tensorrt.region.fused_kernel` (`qwen3_kernels.py` holds
+the kernels). Each block replaces several small TensorRT kernels and the gaps between them:
+
+| Block | Fuses |
+|---|---|
+| `attn_in` | [residual add +] input RMSNorm + q/k/v GEMVs (three outputs) |
+| `qk_rope` | q/k per-head RMSNorm + RoPE, with the softmax scale folded into q |
+| `attn_out` | o_proj GEMV + residual add |
+| `mlp_in` | [residual add +] post-attention RMSNorm + gate/up GEMVs + SiLU(gate) * up |
+| `mlp_out` | down GEMV + residual add |
+| `final` | final RMSNorm + lm_head GEMV |
+
+```python
+import qwen3_regions
+
+qwen3_regions.patch_qwen3(model, qwen3_regions.PRESETS["layers"])  # a loaded FP16 Qwen3ForCausalLM
+decode = qwen3_regions.compile_decode(model, max_seq_len=192, device=torch.device("cuda:0"))
+torch_tensorrt.runtime.set_cudagraphs_mode(True)  # required, see below
+```
+
+The KV-cache write and attention stay in TensorRT (`static_cache_v3`). The kernels accumulate in
+FP32 and round each output once. On an RTX 5090 (FP16, batch 1, CUDA graphs) the `layers` preset
+decodes Qwen3-0.6B in 1.02-1.03 ms/token against 1.18 ms/token without regions (339 to 202
+kernels per token), with top-1 agreement 1.0 and half the KL divergence. The `final` block is
+neutral: TensorRT's lm_head GEMV already runs at DRAM bandwidth. Constraints:
+
+- Run under CUDA graphs: TensorRT 11.4 reloads a QDP plugin's module on every enqueue otherwise.
+- Batch 1, single-token decode, FP16 weights, Qwen3 (no q/k/v biases) with a power-of-two hidden
+  size and head size (Qwen3-0.6B, 1.7B and 8B; not 4B, 14B or 32B); `BLOCK_N` and `BLOCK_K` are
+  powers of two that divide each GEMV's rows and columns.
+- Regions build with `offload_module_to_cpu=False`: release the PyTorch weights after compiling
+  (`torch_tensorrt.dynamo.utils.deallocate_module(model)`), as `agentic_decode.py` does; the engine
+  holds its own copy.
+- Loads carry `tl.multiple_of(..., 16)` hints (the plugin compile path drops Triton's alignment
+  specialization) and an L2 `evict_first` policy for weights (otherwise the streamed weights
+  evict the KV cache and slow TensorRT's own kernels).
+
 ### Agentic decode optimization
 
 `run_agentic_decode.py` runs a `torch_tensorrt.agentic` optimization session on batch-1 decode
@@ -600,16 +640,28 @@ directory holds every trial's evidence, the report (`report.md`) and the exporte
 #### Results: Qwen3-0.6B decode on an RTX 5090
 
 Batch 1, 128 prompt tokens, 64 decoded tokens per measured call; TensorRT 11.4, Torch-TensorRT
-Python runtime, driver 610.57, a GPU shared with another process. Both sessions started from the
+Python runtime, driver 610.57, a GPU shared with another process. All sessions started from the
 documented configuration (FP16, `static_v2`) and checked every candidate against FP32 eager logits.
+Sessions A and B ran before `kernels.decode_blocks`, the build routes, noise calibration and
+paired racing existed; session C had all of them.
 
 | Session | Planner | Trials | Baseline | Best | Confirmed gain | Best recipe |
 |---|---|---|---|---|---|---|
 | A | heuristic | 10 | 2.922 ms/token | 1.251 ms/token | +56.9% (2.34x tokens/s) | `static_v3`, `use_fp32_acc=False` |
 | B | agent (`claude`) | 6, then the agent stopped | 2.923 ms/token | 1.235 ms/token | +57.1% (2.37x tokens/s) | `static_v3`, CUDA graphs, `use_fp32_acc=False` |
+| C | agent (`claude`) with a research brief | 5, then the agent stopped | 2.947 ms/token | 1.031 ms/token | +64.7% (2.86x tokens/s) | `static_v3`, CUDA graphs, `kernels.decode_blocks=all` |
 
-Top-1 agreement stayed 1.0 (mean KL 1.9e-5 to 4.5e-5) and process GPU memory fell from 2160 MB
-to about 2040 MB. "Confirmed" is the median of two fresh baseline/best worker pairs.
+Top-1 agreement stayed 1.0 (mean KL 1.9e-5 to 4.5e-5). "Confirmed" is the median of two fresh
+baseline/best worker pairs. Process GPU memory fell from 2160 MB to about 2020 MB. (Session C
+recorded 3176 MB for the fused blocks: the workload left the PyTorch weights on the GPU, since
+region builds cannot offload them; it now releases them, and a fused build measures 2018 MB.)
+
+Session C, step by step: three fresh-process runs of the baseline moved 0.8%, so the promotion
+threshold stayed at the 2% minimum. The agent paired `static_v3` with CUDA graphs (1.29 ms/token,
+raced +55.5% in two interleaved pairs), then chose the fused decoder blocks (1.031 ms/token, raced
++20.5%; 73% of memory-bandwidth-bound speed). Two edits of the blocks' launch settings (patch slot
+`decode_launch`) and one attention build route measured 0.3-1.4% slower and were rejected; the agent
+then stopped, judging that the remaining gap in its slowest kernel was worth at most about 6%.
 
 What the sessions measured:
 
@@ -621,8 +673,11 @@ What the sessions measured:
 - No gain beyond noise: CUDA graphs (decode is GPU-bound after `static_v3`), pre-allocated outputs,
   builder optimization levels 4 and 5. Slower: BF16 (8-21%), FP32 (50%). TensorRT 11.4 failed to
   build the engine with tiling optimization (`moderate`, `fast`); the sessions recorded the error.
-- About 70% of the remaining GPU time is cuBLAS GEMV over FP16 weights, which is memory-bound:
-  weight quantization (ModelOpt) is the next lever.
+- Without the fused blocks, about 70% of the remaining GPU time is cuBLAS GEMV over FP16 weights
+  and the rest is many small kernels (norms, residual adds, RoPE, SiLU). With them (session C),
+  the Triton block kernels take about 85% of GPU time at 1.2-1.7 TB/s and TensorRT's decode
+  attention 11%. The remaining levers are programmatic dependent launch between kernels, fusing the
+  KV-cache write and attention into the q/k block, and weight quantization (ModelOpt).
 - The exported `decode.ep` reloads in a fresh process with the same accuracy. Called through
   `torch_tensorrt.load(...).module()` it decoded at 1.50 ms/token, 0.25 ms more than in the
   session, because the loaded program checks its 58 inputs on every call.
