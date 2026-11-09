@@ -50,6 +50,31 @@ SerializedTorchTensorRTModuleFmt = Tuple[
 ]
 
 
+def _python_engine_runs_eagerly(input_tensors: List[torch.Tensor]) -> bool:
+    """Whether a Python-runtime engine may run outside the custom op.
+
+    True only for the Python runtime in plain eager execution: not inside
+    ``torch.compile``, ``torch.jit.trace`` or a ``torch.func`` transform
+    (``functionalize``, ``vmap``, ``grad``), with no dispatch mode active,
+    including pre-dispatch ones (export, ``make_fx``, fake and functional
+    tensors push one), and with plain tensor inputs that do not require
+    gradients. Anywhere else the ``tensorrt::execute_engine`` op must stand
+    in for the engine, so tracers record it and autograd sees what it sees.
+    """
+    return (
+        not ENABLED_FEATURES.torch_tensorrt_runtime
+        and not torch.compiler.is_compiling()
+        and not torch.jit.is_tracing()
+        and torch._C._len_torch_dispatch_stack() == 0
+        and torch._ops._len_torch_dispatch_stack_pre_dispatch() == 0
+        and torch._C._functorch.peek_interpreter_stack() is None
+        and all(
+            type(tensor) is torch.Tensor and not tensor.requires_grad
+            for tensor in input_tensors
+        )
+    )
+
+
 def user_output_count(
     output_binding_names: List[str], aliased_io: Dict[str, Tuple[str, str]]
 ) -> int:
@@ -778,9 +803,20 @@ class TorchTensorRTModule(torch.nn.Module):  # type: ignore[misc]
                     scalar_tensor = scalar_tensor.unsqueeze(0)
                 input_tensors.append(scalar_tensor.cuda())
 
-        outputs: List[Any] = torch.ops.tensorrt.execute_engine(
-            list(input_tensors), self.engine
-        )
+        outputs: List[Any]
+        if self.aliased_io and _python_engine_runs_eagerly(input_tensors):
+            # The ``tensorrt::execute_engine`` custom op must clone every output
+            # that aliases an input (PyTorch forbids a custom op from returning
+            # its inputs), so an engine that updates a KV cache in place would
+            # copy each cache on every call. Plain eager execution needs no such
+            # protection: run the engine directly and return the updated inputs.
+            engine: Any = self.engine
+            raw = engine.execute(list(input_tensors))
+            outputs = [raw] if isinstance(raw, torch.Tensor) else list(raw)
+        else:
+            outputs = torch.ops.tensorrt.execute_engine(
+                list(input_tensors), self.engine
+            )
 
         # The interpreter may have appended extra "side-effect" outputs to
         # satisfy the network-output requirement of aliased layers (e.g.
