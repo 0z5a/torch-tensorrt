@@ -9,11 +9,19 @@ are scripted per tool value, so controller behavior is deterministic.
 """
 
 import time
+from pathlib import Path
 from typing import Any, Mapping
 
 import torch
-
-from torch_tensorrt.agentic import Candidate, Case, ModuleCase, Timing, Tool
+from torch_tensorrt.agentic import (
+    Candidate,
+    Case,
+    ModuleCase,
+    PatchSlot,
+    Timing,
+    Tool,
+    load_module,
+)
 
 FAKE_TOOLS = (
     Tool(
@@ -30,13 +38,21 @@ FAKE_TOOLS = (
 
 
 class FakeCandidate(Candidate):
-    def __init__(self, milliseconds: float, output: torch.Tensor) -> None:
+    def __init__(
+        self, milliseconds: float, output: torch.Tensor, wobble_calls: int = 0
+    ) -> None:
         self.milliseconds = milliseconds
         self.output = output
         self.units = 2
+        # The first wobble_calls calls alternate between 1x and 3x the time,
+        # like a run that shares the GPU with another job.
+        self.wobble_calls = wobble_calls
+        self.calls = 0
 
     def __call__(self) -> torch.Tensor:
-        time.sleep(self.milliseconds / 1000)
+        factor = 3.0 if self.calls < self.wobble_calls and self.calls % 2 else 1.0
+        self.calls += 1
+        time.sleep(self.milliseconds * factor / 1000)
         return self.output.clone()
 
     def describe(self) -> dict[str, Any]:
@@ -62,6 +78,8 @@ class FakeCase(Case):
         inaccurate: tuple = (),
         baseline_changes: Mapping[str, Any] | None = None,
         reference_fails: bool = False,
+        wobble_calls: int = 0,
+        slot: bool = False,
     ) -> None:
         self.milliseconds = milliseconds
         self.speedups = dict(speedups or {})
@@ -69,6 +87,8 @@ class FakeCase(Case):
         self.inaccurate = set(inaccurate)
         self.baseline_changes = dict(baseline_changes or {})
         self.reference_fails = reference_fails
+        self.wobble_calls = wobble_calls
+        self.slot = slot
 
     def tools(self):
         return FAKE_TOOLS
@@ -81,6 +101,12 @@ class FakeCase(Case):
 
     def accuracy_defaults(self):
         return {"max_abs_error": ("<=", 1e-3)}
+
+    def patch_slots(self):
+        if not self.slot:
+            return ()
+        path = Path(__file__).with_name("_fake_slot.py")
+        return (PatchSlot("speed", str(path), "SPEED scales the latency"),)
 
     def reference(self):
         if self.reference_fails:
@@ -95,8 +121,10 @@ class FakeCase(Case):
         for option, factor in self.speedups.items():
             if option in options:
                 milliseconds *= factor
+        if values.get("patch.speed"):
+            milliseconds *= load_module(values["patch.speed"], "fake_speed").SPEED
         output = torch.ones(4) * (1.5 if options & self.inaccurate else 1.0)
-        return FakeCandidate(milliseconds, output)
+        return FakeCandidate(milliseconds, output, self.wobble_calls)
 
 
 def create_fake(**kwargs: Any) -> FakeCase:

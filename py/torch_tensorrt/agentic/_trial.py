@@ -73,7 +73,6 @@ def environment() -> dict[str, Any]:
     import subprocess
 
     import tensorrt
-
     import torch_tensorrt
 
     driver = None
@@ -120,11 +119,13 @@ def describe_case(case: Any) -> dict[str, Any]:
         "accuracy_defaults": {
             name: list(bound) for name, bound in case.accuracy_defaults().items()
         },
+        "patch_slots": [slot.to_json() for slot in case.patch_slots()],
     }
 
 
 def run(request: dict[str, Any]) -> dict[str, Any]:
     from torch_tensorrt.agentic._evaluator import evaluate
+    from torch_tensorrt.agentic._patches import PatchStore, is_patch_key
     from torch_tensorrt.agentic._spec import Timing, Workload
     from torch_tensorrt.agentic._tools import catalog, resolve
 
@@ -141,6 +142,15 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         return result
     tools = catalog(case.tools())
     values = resolve(request["recipe"], tools)
+    slots = {slot.key: slot for slot in case.patch_slots()}
+    for key in [key for key in values if is_patch_key(key)]:
+        if key not in slots:
+            raise ValueError(
+                f"The recipe patches {key}, which the case does not declare"
+            )
+        values[key] = str(PatchStore(Path(request["patch_dir"])).path(values[key]))
+    for key in slots:
+        values.setdefault(key, None)
     export_dir = request.get("export_dir")
     return evaluate(
         case,
@@ -149,6 +159,7 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         Timing(**request["timing"]),
         profile=bool(request.get("profile", True)),
         export_dir=Path(export_dir) if export_dir else None,
+        measurement=request.get("measurement"),
     )
 
 

@@ -267,3 +267,63 @@ class Timing:
                 raise ValueError(f"Timing {name} must be a non-negative integer")
         if self.rounds < 3 or self.calls < 1:
             raise ValueError("Timing needs at least 3 rounds of at least 1 call")
+
+
+@dataclass(frozen=True)
+class Measurement:
+    """How the session tells a real gain from run-to-run noise.
+
+    Samples within one run vary far less than the same recipe measured in two
+    processes (engine builds, clocks, other GPU tenants), so neither single
+    runs nor their quartiles can show a gain of a few percent.
+
+    * ``calibration_runs`` extra fresh-process runs of the baseline measure
+      that spread (an A/A test). A candidate must then improve by more than
+      ``max(goal.min_improvement, noise_factor * spread)``.
+    * A candidate that clears it in its own run is raced: ``race_pairs`` fresh
+      incumbent/candidate worker pairs run back to back in alternating order,
+      and it is promoted only if every pair agrees and their median gain
+      clears the threshold. ``0`` judges on the single run. Only an even
+      number of pairs balances the order (the incumbent runs first in the
+      extra pair of an odd count); the final confirmation's
+      ``confirm_repeats`` pairs alternate the same way.
+    * Each worker waits for the GPU to be idle (at most 5% busy, by
+      nvidia-smi) before timing, ``quiet_gpu_s`` seconds in total, and
+      re-times up to ``retries`` times when its samples' interquartile range
+      exceeds ``max_spread`` of the median or the GPU was busy. A measurement
+      that stays unstable is never promoted, and an unstable baseline ends
+      the session. ``quiet_gpu_s=0`` turns the wait off. Keep the worst case
+      (``quiet_gpu_s`` plus the build and the timing) below the budget's
+      ``trial_timeout_s``.
+    """
+
+    calibration_runs: int = 2
+    race_pairs: int = 2
+    noise_factor: float = 2.0
+    quiet_gpu_s: float = 600.0
+    retries: int = 2
+    max_spread: float = 0.03
+
+    def __post_init__(self) -> None:
+        for name in ("calibration_runs", "race_pairs", "retries"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"Measurement {name} must be a non-negative integer")
+        for name in ("noise_factor", "max_spread"):
+            value = getattr(self, name)
+            if not (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value > 0
+            ):
+                raise ValueError(
+                    f"Measurement {name} must be a positive number; got {value!r}"
+                )
+        if not (
+            isinstance(self.quiet_gpu_s, (int, float))
+            and not isinstance(self.quiet_gpu_s, bool)
+            and math.isfinite(self.quiet_gpu_s)
+            and self.quiet_gpu_s >= 0
+        ):
+            raise ValueError("Measurement quiet_gpu_s must be a non-negative number")

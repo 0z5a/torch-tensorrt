@@ -5,7 +5,6 @@ import math
 
 import pytest
 import torch
-
 from torch_tensorrt.agentic import (
     Budget,
     Constraints,
@@ -198,3 +197,157 @@ def test_module_case_tools_default_to_its_compile_options():
         ModuleCase(
             torch.nn.Linear(2, 2), [], regions={"x": "missing"}, generator=object()
         )
+
+
+def test_roofline_and_copy_signals_point_at_memory_bound_work():
+    from torch_tensorrt.agentic._profile import signals
+
+    found = signals(
+        {
+            "host_overhead_fraction": 0.0,
+            "device_ms": 1.0,
+            "copy_ms": 0.05,
+            "host_syncs": 0,
+            "kernels": 300,
+            "top_kernels": [],
+        },
+        {"trt_engines": 1, "torch_partitions": 0},
+        {},
+        {
+            "bytes_per_unit": 1.2e9,
+            "peak_read_gbps": 1700.0,
+            "floor_ms": 0.71,
+            "fraction": 0.6,
+        },
+    )
+    names = [found_signal["signal"] for found_signal in found]
+    assert names == ["roofline_gap", "copy_overhead"]
+    assert "60% of memory-bandwidth-bound speed" in found[0]["detail"]
+    assert "5% of GPU time is memory copies" in found[1]["detail"]
+    close = signals(
+        None,
+        {},
+        {},
+        {
+            "bytes_per_unit": 1.0,
+            "peak_read_gbps": 1.0,
+            "floor_ms": 1.0,
+            "fraction": 0.9,
+        },
+    )
+    assert close == []
+
+
+def test_patch_edits_stay_inside_their_fences():
+    from torch_tensorrt.agentic._patches import apply_edits, check_source, fenced_spans
+
+    source = "a = 1\n# EVOLVE-BLOCK-START\nb = 2\nc = 3\n# EVOLVE-BLOCK-END\nd = 4\n"
+    assert apply_edits(source, [{"search": "b = 2", "replace": "b = 5"}]).count("b = 5")
+    for edits, match in (
+        ([{"search": "a = 1", "replace": "a = 9"}], "not inside"),
+        ([{"search": "= ", "replace": "="}], "occurs 2 times inside"),
+        ([{"search": "b = 2", "replace": "# EVOLVE-BLOCK-END"}], "fences"),
+        ([{"search": "", "replace": "x"}], "non-empty"),
+        ([], "at least one edit"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            apply_edits(source, edits)
+    with pytest.raises(ValueError, match="unterminated"):
+        fenced_spans("# EVOLVE-BLOCK-START\nx = 1\n")
+    with pytest.raises(ValueError, match="does not compile"):
+        check_source("def (:\n", "slot.py")
+
+
+def test_patch_edits_keep_the_fences_and_match_only_inside_them():
+    from torch_tensorrt.agentic._patches import apply_edits
+
+    source = "x = 1\n# EVOLVE-BLOCK-START\nx = 1\nPAD = (1, 1, 1)\n# EVOLVE-BLOCK-END\n"
+    # The fenced occurrence is edited even though the text also occurs outside.
+    edited = apply_edits(source, [{"search": "x = 1", "replace": "x = 2"}])
+    assert edited.startswith("x = 1\n# EVOLVE-BLOCK-START\nx = 2\n")
+    for edits, match in (
+        # Code merged onto the END fence line would leave the block empty.
+        ([{"search": "PAD = (1, 1, 1)\n", "replace": "PAD = 0"}], "fence line"),
+        ([{"search": "x = 1\nPAD = (1, 1, 1)\n", "replace": ""}], "empty"),
+        # Overlapping occurrences are ambiguous too.
+        ([{"search": "1, 1", "replace": "2, 2"}], "occurs 2 times inside"),
+        ([{"search": "y = 3", "replace": "y = 4"}], "does not occur"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            apply_edits(source, edits)
+
+
+def test_patch_slots_resolve_their_path_and_record_its_digest(tmp_path, monkeypatch):
+    import hashlib
+
+    from torch_tensorrt.agentic import PatchSlot
+
+    (tmp_path / "kernels.py").write_text(
+        "# EVOLVE-BLOCK-START\nN = 1\n# EVOLVE-BLOCK-END\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    slot = PatchSlot("kernels", "kernels.py", "launch settings")
+    assert slot.path == str(tmp_path / "kernels.py")
+    recorded = slot.to_json()
+    assert (
+        recorded["sha256"]
+        == hashlib.sha256((tmp_path / "kernels.py").read_bytes()).hexdigest()
+    )
+    assert PatchSlot.from_json(recorded) == slot
+
+
+def test_measurement_rejects_missing_or_infinite_numbers():
+    from torch_tensorrt.agentic import Measurement
+
+    for kwargs in (
+        {"max_spread": None},
+        {"noise_factor": None},
+        {"max_spread": float("inf")},
+        {"noise_factor": 0},
+        {"quiet_gpu_s": -1},
+        {"race_pairs": 1.5},
+    ):
+        with pytest.raises(ValueError, match="Measurement"):
+            Measurement(**kwargs)
+
+
+def test_tools_declare_and_recipes_respect_requirements():
+    from torch_tensorrt.agentic import Tool
+    from torch_tensorrt.agentic._tools import apply, catalog
+
+    graphs = Tool("runtime.cudagraphs", (False, True), False, "graphs")
+    blocks = Tool(
+        "kernels.blocks", ("", "fused"), "", "fused", (), {"runtime.cudagraphs": True}
+    )
+    assert blocks.to_json()["requires"] == {"runtime.cudagraphs": True}
+    tools = catalog([graphs, blocks])
+    with pytest.raises(ValueError, match="requires runtime.cudagraphs=True"):
+        apply({}, {"kernels.blocks": "fused"}, tools)
+    both = {"kernels.blocks": "fused", "runtime.cudagraphs": True}
+    assert apply({}, both, tools) == both
+    # Turning the requirement off again is refused while the option is set.
+    with pytest.raises(ValueError, match="requires"):
+        apply(both, {"runtime.cudagraphs": False}, tools)
+    with pytest.raises(ValueError, match="catalog does not offer"):
+        catalog([blocks])
+    with pytest.raises(ValueError, match="cannot require itself"):
+        Tool("kernels.x", (0, 1), 0, "x", (), {"kernels.x": 1})
+
+
+def test_recipes_carry_patch_digests_beside_tools():
+    from torch_tensorrt.agentic._tools import apply, catalog, difference, resolve
+
+    from ._cases import FAKE_TOOLS
+
+    tools = catalog(FAKE_TOOLS)
+    sha = "a" * 64
+    recipe = apply({}, {"patch.speed": sha, "runtime.cudagraphs": True}, tools)
+    assert recipe == {"patch.speed": sha, "runtime.cudagraphs": True}
+    assert resolve(recipe, tools)["patch.speed"] == sha
+    assert difference({}, recipe, tools) == {
+        "runtime.cudagraphs": True,
+        "patch.speed": sha,
+    }
+    assert apply(recipe, {"patch.speed": ""}, tools) == {"runtime.cudagraphs": True}
+    with pytest.raises(ValueError, match="patch digest"):
+        apply({}, {"patch.speed": "not-a-digest"}, tools)

@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 
 import pytest
-
 from torch_tensorrt.agentic import (
     Budget,
     Constraints,
     Goal,
+    Measurement,
     OptimizationSession,
     Planner,
     Proposal,
@@ -22,6 +22,9 @@ from torch_tensorrt.agentic import (
 )
 
 FACTORY = f"{Path(__file__).with_name('_cases.py')}:create_fake"
+# The fake workload sleeps, so its samples spread widely on a loaded machine;
+# these tests script decisions, not stability, which has its own tests below.
+SINGLE_RUN = Measurement(calibration_runs=0, race_pairs=0, quiet_gpu_s=0, max_spread=10)
 
 
 @pytest.fixture
@@ -34,23 +37,38 @@ def jobs(monkeypatch):
 
     class Jobs(list):
         slow_best_confirmations = False
+        slow_race_candidates = False
+        unstable: set = set()
 
     recorded = Jobs()
 
     def execute(self, request, directory):
-        recorded.append((directory.relative_to(self.directory).as_posix(), request))
+        name = directory.relative_to(self.directory).as_posix()
+        recorded.append((name, request))
         try:
             result = _trial.run(request)
         except Exception as error:  # noqa: BLE001 - like the worker's own handler
             result = {"status": "failed", "stage": "setup", "error": str(error)}
-        if (
+        slow = (
             recorded.slow_best_confirmations
             and directory.parent.name == "confirm"
             and directory.name.endswith("best")
-            and result.get("status") == "ok"
-        ):
+        ) or (
+            recorded.slow_race_candidates
+            and directory.parent.name == "race"
+            and directory.name.endswith("candidate")
+        )
+        if slow and result.get("status") == "ok":
             result["latency_ms"] = {k: v * 3 for k, v in result["latency_ms"].items()}
             result["throughput"] /= 3
+        if name in recorded.unstable and result.get("status") == "ok":
+            result["measurement"] = {
+                "attempts": 3,
+                "spreads": [0.2, 0.2, 0.2],
+                "gpu_wait_s": 0.0,
+                "gpu_quiet": False,
+                "stable": False,
+            }
         _trial.write_json(Path(request["result_path"]), result)
         return result
 
@@ -64,6 +82,9 @@ def session(directory, kwargs=None, **options):
     options.setdefault("goal", Goal(min_improvement=0.2))
     options.setdefault("budget", Budget(max_trials=3))
     options.setdefault("confirm_repeats", 1)
+    # These tests script the worker sequence one run per trial; calibration and
+    # racing are covered on their own below.
+    options.setdefault("measurement", SINGLE_RUN)
     return OptimizationSession(
         Workload(FACTORY, kwargs or {}), directory=directory, **options
     )
@@ -316,3 +337,305 @@ def test_cli_reports_status_and_the_report(tmp_path, jobs, capsys):
     assert cli.main(["report", str(tmp_path / "s")]) == 0
     assert "# Optimization session report" in capsys.readouterr().out
     assert cli.main(["status", str(tmp_path)]) == 1
+
+
+def calibrated(directory, kwargs=None, **options):
+    options.setdefault(
+        "measurement",
+        Measurement(calibration_runs=2, race_pairs=2, quiet_gpu_s=0, max_spread=10),
+    )
+    return session(directory, kwargs, **options)
+
+
+def test_calibration_sets_the_threshold_and_racing_confirms_gains(tmp_path, jobs):
+    result = calibrated(
+        tmp_path / "s",
+        {"speedups": {"runtime.cudagraphs=True": 0.5}},
+        budget=Budget(max_trials=2),
+    ).run()
+    assert [name for name, _ in jobs] == [
+        "reference",
+        "trials/0000",
+        "calibration/0",
+        "calibration/1",
+        "trials/0001",
+        "trials/0002",
+        # Interleaved pairs, alternating which side runs first.
+        "trials/0002/race/0-incumbent",
+        "trials/0002/race/0-candidate",
+        "trials/0002/race/1-candidate",
+        "trials/0002/race/1-incumbent",
+        "confirm/0-baseline",
+        "confirm/0-best",
+        "export",
+    ]
+    calibration = json.loads(
+        (tmp_path / "s" / "calibration" / "summary.json").read_text()
+    )
+    assert len(calibration["metrics"]) == 3
+    # The fake workload sleeps, so its spread depends on the machine's load;
+    # the threshold is the goal's 20% or twice that spread, whichever is larger.
+    spread = calibration["spread"]
+    assert spread == pytest.approx(
+        (max(calibration["metrics"]) - min(calibration["metrics"]))
+        / sorted(calibration["metrics"])[1]
+    )
+    assert calibration["threshold"] == pytest.approx(max(0.2, 2 * spread))
+    assert result.calibration["threshold"] == calibration["threshold"]
+    decision = json.loads(
+        (tmp_path / "s" / "trials" / "0002" / "decision.json").read_text()
+    )
+    assert decision["decision"] == "promoted"
+    assert decision["reason"].startswith("raced: median paired gain")
+    assert len(decision["race"]["gains"]) == 2
+    assert min(decision["race"]["gains"]) > 0.3
+    assert result.decision == "promoted"
+    ledger = (tmp_path / "s" / "ledger.tsv").read_text().splitlines()
+    assert ledger[0].split("\t")[:4] == ["trial", "parent", "decision", "metric"]
+    assert [row.split("\t")[2] for row in ledger[1:]] == [
+        "baseline",
+        "rejected",
+        "promoted",
+    ]
+    paired_gain = float(ledger[3].split("\t")[4].rstrip("%")) / 100
+    assert paired_gain == pytest.approx(0.5, abs=0.1)
+
+
+def test_racing_rejects_a_gain_that_does_not_hold_in_paired_runs(tmp_path, jobs):
+    jobs.slow_race_candidates = True
+    result = calibrated(
+        tmp_path / "s",
+        {"speedups": {"runtime.cudagraphs=True": 0.5}},
+        budget=Budget(max_trials=2),
+    ).run()
+    decision = json.loads(
+        (tmp_path / "s" / "trials" / "0002" / "decision.json").read_text()
+    )
+    assert decision["decision"] == "rejected"
+    assert decision["reason"].startswith("not confirmed in paired runs")
+    assert decision["screen"].startswith("latency_ms improved")
+    assert result.decision == "baseline retained"
+
+
+def test_unstable_measurements_are_never_promoted(tmp_path, jobs):
+    jobs.unstable = {"trials/0002"}
+    calibrated(
+        tmp_path / "s",
+        {"speedups": {"runtime.cudagraphs=True": 0.5}},
+        budget=Budget(max_trials=2),
+    ).run()
+    decision = json.loads(
+        (tmp_path / "s" / "trials" / "0002" / "decision.json").read_text()
+    )
+    assert decision["decision"] == "rejected"
+    assert decision["reason"].startswith("unstable measurement: interquartile spread")
+    assert "the GPU was busy" in decision["reason"]
+
+
+def test_resume_reuses_the_calibration(tmp_path, jobs):
+    calibrated(tmp_path / "s", budget=Budget(max_trials=1)).run()
+    first = [name for name, _ in jobs]
+    assert first.count("calibration/0") == 1
+    jobs.clear()
+    calibrated(tmp_path / "s", budget=Budget(max_trials=2)).run()
+    assert not any(name.startswith("calibration/") for name, _ in jobs)
+
+
+def test_the_evaluator_retimes_unstable_samples():
+    from torch_tensorrt.agentic._evaluator import evaluate
+    from torch_tensorrt.agentic._spec import Timing
+    from torch_tensorrt.agentic._tools import catalog, resolve
+
+    from ._cases import FAKE_TOOLS, FakeCase
+
+    values = resolve({}, catalog(FAKE_TOOLS))
+    timing = Timing(warmup=0, rounds=5, calls=1, profile_calls=0)
+    settings = {"quiet_gpu_s": 0, "max_spread": 0.1}
+    # The accuracy check takes call 0; calls 1-5 (the first attempt) wobble.
+    # 20 ms calls keep sleep jitter on a busy machine well inside the 10% limit.
+    case = FakeCase(milliseconds=20.0, wobble_calls=6)
+    retimed = evaluate(
+        case, values, case.reference(), timing, measurement={**settings, "retries": 2}
+    )
+    assert retimed["measurement"]["attempts"] == 2
+    assert retimed["measurement"]["stable"]
+    assert retimed["measurement"]["spreads"][0] > 0.1
+    case = FakeCase(milliseconds=20.0, wobble_calls=6)
+    once = evaluate(
+        case, values, case.reference(), timing, measurement={**settings, "retries": 0}
+    )
+    assert once["measurement"]["attempts"] == 1
+    assert not once["measurement"]["stable"]
+
+
+class PatchScript(Planner):
+    """Return the given proposals in order, then stop."""
+
+    name = "patch-script"
+
+    def __init__(self, proposals):
+        self.proposals = list(proposals)
+        self.evidence = []
+
+    def propose(self, evidence, workdir):
+        self.evidence.append(evidence)
+        if not self.proposals:
+            return Proposal(stop=True, rationale="script done")
+        return self.proposals.pop(0)
+
+
+def test_code_patches_are_validated_stored_measured_and_promoted(tmp_path, jobs):
+    planner = PatchScript(
+        [
+            Proposal(
+                patches={
+                    "speed": [{"search": "SPEED = 1.0", "replace": "SPEED = 0.4"}]
+                },
+                rationale="halve the time",
+            ),
+            # Outside the fence: refused before anything runs.
+            Proposal(
+                patches={"speed": [{"search": "fenced factor", "replace": "factor"}]}
+            ),
+            Proposal(patches={"nope": [{"search": "x", "replace": "y"}]}),
+            Proposal(
+                patches={"speed": [{"search": "SPEED = 0.4", "replace": "SPEED = ("}]}
+            ),
+        ]
+    )
+    result = session(
+        tmp_path / "s",
+        {"slot": True},
+        planner=planner,
+        budget=Budget(max_trials=4),
+        brief="Try code before knobs.",
+    ).run()
+    root = tmp_path / "s"
+    assert decisions(root) == ["baseline", "promoted", "invalid", "invalid", "invalid"]
+    reasons = [
+        json.loads((root / "trials" / f"{n:04d}" / "decision.json").read_text())[
+            "reason"
+        ]
+        for n in (2, 3, 4)
+    ]
+    assert "not inside an EVOLVE-BLOCK region" in reasons[0]
+    assert "Unknown patch slot 'nope'" in reasons[1]
+    assert "does not compile" in reasons[2]
+    sha = result.recipe["patch.speed"]
+    assert (root / "patches" / f"{sha}.py").read_text().count("SPEED = 0.4") == 1
+    assert result.decision == "promoted"
+    assert result.confirmation["median_gain"] == pytest.approx(0.6, abs=0.1)
+    # The planner saw the slot, then the incumbent's patched source, and the brief.
+    first, second = planner.evidence[0], planner.evidence[1]
+    assert first["patch_slots"][0]["editable_blocks"] == ["SPEED = 1.0\n"]
+    assert second["patch_slots"][0]["editable_blocks"] == ["SPEED = 0.4\n"]
+    assert second["patch_slots"][0]["patched"] == sha
+    assert first["brief"] == "Try code before knobs."
+
+
+def test_a_retry_counts_once_the_gpu_went_quiet(monkeypatch):
+    from torch_tensorrt.agentic import _evaluator
+    from torch_tensorrt.agentic._spec import Timing
+    from torch_tensorrt.agentic._tools import catalog, resolve
+
+    from ._cases import FAKE_TOOLS, FakeCase
+
+    gates = []
+
+    def gate(max_wait_s):
+        gates.append(max_wait_s)
+        if len(gates) == 1:
+            return {"waited_s": 7.0, "quiet": False}
+        return {"waited_s": 1.0, "quiet": True}
+
+    monkeypatch.setattr(_evaluator, "wait_for_quiet_gpu", gate)
+    values = resolve({}, catalog(FAKE_TOOLS))
+    timing = Timing(warmup=0, rounds=5, calls=1, profile_calls=0)
+    settings = {"quiet_gpu_s": 10, "max_spread": 10}
+    case = FakeCase(milliseconds=2.0)
+    result = _evaluator.evaluate(
+        case, values, case.reference(), timing, measurement={**settings, "retries": 2}
+    )
+    measurement = result["measurement"]
+    assert measurement["attempts"] == 2
+    assert measurement["gpu_quiet"] is True and measurement["stable"]
+    # quiet_gpu_s bounds the whole wait; once spent, an attempt still looks briefly.
+    assert gates == [10, 3.0]
+    gates.clear()
+    case = FakeCase(milliseconds=2.0)
+    once = _evaluator.evaluate(
+        case, values, case.reference(), timing, measurement={**settings, "retries": 0}
+    )
+    assert once["measurement"]["gpu_quiet"] is False
+    assert not once["measurement"]["stable"]
+
+
+def test_a_calibration_is_redone_when_its_settings_change(tmp_path, jobs):
+    session(tmp_path / "s", budget=Budget(max_trials=1)).run()
+    assert not any(name.startswith("calibration/") for name, _ in jobs)
+    jobs.clear()
+    calibrated(tmp_path / "s", budget=Budget(max_trials=1)).run()
+    names = [name for name, _ in jobs]
+    assert names.count("calibration/0") == names.count("calibration/1") == 1
+    summary = json.loads((tmp_path / "s/calibration/summary.json").read_text())
+    assert summary["requested"] == 2 and summary["spread"] is not None
+
+
+def test_patch_changes_must_name_a_declared_slot_and_a_stored_patch(tmp_path, jobs):
+    planner = PatchScript(
+        [
+            Proposal(changes={"patch.speed": "0" * 64}),
+            Proposal(changes={"patch.nope": ""}),
+        ]
+    )
+    session(tmp_path / "s", {"slot": True}, planner=planner).run()
+    root = tmp_path / "s"
+    assert decisions(root) == ["baseline", "invalid", "invalid"]
+    reasons = [
+        json.loads((root / "trials" / f"{n:04d}" / "decision.json").read_text())[
+            "reason"
+        ]
+        for n in (1, 2)
+    ]
+    assert "names no stored patch" in reasons[0]
+    assert "Unknown patch slot 'patch.nope'" in reasons[1]
+
+
+def test_a_patch_that_restores_the_original_is_the_original(tmp_path, jobs):
+    planner = PatchScript(
+        [
+            Proposal(
+                patches={"speed": [{"search": "SPEED = 1.0", "replace": "SPEED = 0.4"}]}
+            ),
+            Proposal(
+                patches={"speed": [{"search": "SPEED = 0.4", "replace": "SPEED = 1.0"}]}
+            ),
+        ]
+    )
+    session(tmp_path / "s", {"slot": True}, planner=planner).run()
+    root = tmp_path / "s"
+    assert decisions(root) == ["baseline", "promoted", "invalid"]
+    reason = json.loads((root / "trials/0002/decision.json").read_text())["reason"]
+    assert "already evaluated" in reason
+
+
+def test_a_resumed_session_forgets_earlier_invalid_proposals(tmp_path, jobs):
+    bad = [Proposal(changes={"engine.turbo": True}) for _ in range(3)]
+    first = session(tmp_path / "s", planner=Scripted(bad)).run()
+    assert first.stop_reason == "the planner made 3 invalid proposals in a row"
+    asked = PatchScript([])
+    second = session(tmp_path / "s", planner=asked).run()
+    assert len(asked.evidence) == 1
+    assert second.stop_reason == "the planner stopped: script done"
+
+
+def test_an_edited_program_md_survives_a_resume(tmp_path, jobs):
+    planner = Scripted([])
+    session(tmp_path / "s", planner=planner, brief="Try A.").run()
+    program = tmp_path / "s" / "program.md"
+    assert program.read_text() == "Try A."
+    program.write_text("Try B instead.")
+    session(tmp_path / "s", planner=Scripted([]), brief="Try A.").run()
+    assert program.read_text() == "Try B instead."
+    session(tmp_path / "s", planner=Scripted([]), brief="Try C.").run()
+    assert program.read_text() == "Try C."

@@ -8,12 +8,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
+from torch_tensorrt.agentic._patches import is_patch_key, is_patch_value
 from torch_tensorrt.agentic._spec import Recipe
 
 # The four optimization layers of a session, plus options a workload defines.
 LAYERS = ("graph", "engine", "kernels", "runtime", "workload")
 # Bottleneck signals the profiler reports (see _profile.signals).
-SIGNALS = ("launch_overhead", "host_syncs", "fallback", "dominant_kernel", "precision")
+SIGNALS = (
+    "launch_overhead",
+    "host_syncs",
+    "fallback",
+    "dominant_kernel",
+    "precision",
+    "roofline_gap",
+    "copy_overhead",
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +34,10 @@ class Tool:
     values (JSON scalars) in the order a heuristic search tries them;
     ``default`` is the value a recipe that omits the tool uses. ``signals``
     names the profiler bottleneck signals the option can relieve.
+    ``requires`` maps other tools to the values every non-default value of
+    this one needs (fused kernels that only run under CUDA graphs, say): a
+    recipe that breaks it is refused before anything is built, and the
+    heuristic planner proposes the requirements together with the option.
     """
 
     name: str
@@ -32,6 +45,7 @@ class Tool:
     default: Any
     description: str
     signals: tuple[str, ...] = ()
+    requires: Any = ()
 
     def __post_init__(self) -> None:
         layer, sep, option = self.name.partition(".")
@@ -55,8 +69,15 @@ class Tool:
             raise ValueError(
                 f"Tool {self.name} names unknown signals {sorted(unknown)}"
             )
+        requires = dict(self.requires)
+        if self.name in requires:
+            raise ValueError(f"Tool {self.name} cannot require itself")
+        for value in requires.values():
+            if not isinstance(value, (str, int, float, bool)) and value is not None:
+                raise ValueError(f"Tool {self.name} requires JSON scalars")
         object.__setattr__(self, "values", values)
         object.__setattr__(self, "signals", tuple(self.signals))
+        object.__setattr__(self, "requires", tuple(sorted(requires.items())))
 
     @property
     def layer(self) -> str:
@@ -70,6 +91,7 @@ class Tool:
             "default": self.default,
             "description": self.description,
             "signals": list(self.signals),
+            "requires": dict(self.requires),
         }
 
 
@@ -134,7 +156,7 @@ GENERIC_TOOLS: tuple[Tool, ...] = (
 
 
 def catalog(tools: Sequence[Tool]) -> dict[str, Tool]:
-    """Index ``tools`` by name, rejecting duplicates."""
+    """Index ``tools`` by name, rejecting duplicates and unmet ``requires``."""
     indexed: dict[str, Tool] = {}
     for tool in tools:
         if not isinstance(tool, Tool):
@@ -142,7 +164,26 @@ def catalog(tools: Sequence[Tool]) -> dict[str, Tool]:
         if tool.name in indexed:
             raise ValueError(f"Tool {tool.name} is defined twice")
         indexed[tool.name] = tool
+    for tool in indexed.values():
+        for name, value in tool.requires:
+            other = indexed.get(name)
+            if other is None or not is_member(value, other.values):
+                raise ValueError(
+                    f"Tool {tool.name} requires {name}={value!r}, which the "
+                    "catalog does not offer"
+                )
     return indexed
+
+
+def unmet_requirements(
+    recipe: Mapping[str, Any], name: str, tools: Mapping[str, Tool]
+) -> dict[str, Any]:
+    """What ``recipe`` lacks of the requirements of tool ``name``."""
+    return {
+        other: value
+        for other, value in tools[name].requires
+        if not is_member(recipe.get(other, tools[other].default), (value,))
+    }
 
 
 def apply(
@@ -156,6 +197,11 @@ def apply(
     """
     merged = dict(recipe)
     for name, value in changes.items():
+        if is_patch_key(name):
+            if value and not is_patch_value(value):
+                raise ValueError(f"{name} must be a patch digest; got {value!r}")
+            merged[name] = value
+            continue
         tool = tools.get(name)
         if tool is None:
             raise ValueError(f"Unknown tool {name!r}; choose one of {sorted(tools)}")
@@ -165,6 +211,13 @@ def apply(
             )
         merged[name] = value
     for name, value in list(merged.items()):
+        if is_patch_key(name):
+            # A patch digest selects a patched source; empty means the original.
+            if not value:
+                del merged[name]
+            elif not is_patch_value(value):
+                raise ValueError(f"Recipe sets {name}={value!r}, not a patch digest")
+            continue
         tool = tools.get(name)
         if tool is None:
             raise ValueError(f"Recipe sets unknown tool {name!r}")
@@ -174,21 +227,36 @@ def apply(
             )
         if _key(value) == _key(tool.default):
             del merged[name]
+    for name in merged:
+        if is_patch_key(name):
+            continue
+        unmet = unmet_requirements(merged, name, tools)
+        if unmet:
+            needs = ", ".join(f"{other}={value!r}" for other, value in unmet.items())
+            raise ValueError(f"{name}={merged[name]!r} requires {needs}")
     return dict(sorted(merged.items()))
 
 
 def resolve(recipe: Mapping[str, Any], tools: Mapping[str, Tool]) -> dict[str, Any]:
-    """Every tool's value under ``recipe``, defaults included."""
+    """Every tool's value under ``recipe``, defaults included, plus its patches."""
     normalized = apply(recipe, {}, tools)
-    return {name: normalized.get(name, tool.default) for name, tool in tools.items()}
+    values = {name: normalized.get(name, tool.default) for name, tool in tools.items()}
+    values.update(
+        {name: value for name, value in normalized.items() if is_patch_key(name)}
+    )
+    return values
 
 
 def difference(
     before: Mapping[str, Any], after: Mapping[str, Any], tools: Mapping[str, Tool]
 ) -> dict[str, Any]:
-    """The options whose value ``after`` changes, with their new values."""
+    """The options (and patches) whose value ``after`` changes, with their new values."""
     old, new = resolve(before, tools), resolve(after, tools)
-    return {name: new[name] for name in tools if _key(old[name]) != _key(new[name])}
+    changed = {name: new[name] for name in tools if _key(old[name]) != _key(new[name])}
+    for name in sorted({*old, *new} - set(tools)):
+        if old.get(name) != new.get(name):
+            changed[name] = new.get(name, "")
+    return changed
 
 
 def compile_settings(values: Mapping[str, Any]) -> dict[str, Any]:

@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 import torch.utils._pytree as pytree
-
+from torch_tensorrt.agentic._patches import PatchSlot
 from torch_tensorrt.agentic._spec import Recipe, Timing
 from torch_tensorrt.agentic._tools import (
     GENERIC_TOOLS,
@@ -32,10 +32,16 @@ class Candidate:
     each call performs ``units`` work units of ``items`` items each (for example
     ``units`` decoded tokens of a batch of ``items`` sequences) and returns the
     outputs that :meth:`Case.compare` checks.
+
+    A memory-bound candidate may set ``bytes_per_unit``, the bytes one work
+    unit must read from device memory (for LLM decode, the weights plus the KV
+    cache). The evaluator then reports the memory-bandwidth floor and the
+    share of it the measured latency reaches.
     """
 
     units: int = 1
     items: int = 1
+    bytes_per_unit: float | None = None
 
     def setup(self) -> None:
         """Prepare state before the first call, for example a prefill."""
@@ -89,6 +95,16 @@ class Case(ABC):
 
     def timing(self) -> Timing:
         return Timing()
+
+    def patch_slots(self) -> Sequence[PatchSlot]:
+        """Source files a planner may edit inside their EVOLVE-BLOCK fences.
+
+        :meth:`build` then receives each slot's patched file as
+        ``values["patch.<name>"]`` (``None`` for the original) and should
+        build from it, for example with
+        :func:`torch_tensorrt.agentic.load_module`.
+        """
+        return ()
 
 
 def compare_outputs(outputs: Any, reference: Any) -> dict[str, float]:

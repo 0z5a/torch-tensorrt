@@ -14,10 +14,18 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
+from torch_tensorrt.agentic._patches import is_patch_key
 from torch_tensorrt.agentic._spec import digest
-from torch_tensorrt.agentic._tools import LAYERS, Tool, apply, catalog, is_member
+from torch_tensorrt.agentic._tools import (
+    LAYERS,
+    Tool,
+    apply,
+    catalog,
+    is_member,
+    unmet_requirements,
+)
 
 _LAYER_ORDER = ("runtime", "engine", "graph", "workload", "kernels")
 _HEURISTIC_FALLBACK: Any = object()
@@ -25,13 +33,19 @@ _HEURISTIC_FALLBACK: Any = object()
 
 @dataclass(frozen=True)
 class Proposal:
-    """The next experiment: tool changes applied to the incumbent recipe, or stop."""
+    """The next experiment: tool changes and code patches to the incumbent, or stop.
+
+    ``patches`` maps a patch slot's name to SEARCH/REPLACE edits
+    (``{"search": ..., "replace": ...}``) of that slot's current source; see
+    :class:`~torch_tensorrt.agentic.PatchSlot`.
+    """
 
     changes: Mapping[str, Any] = field(default_factory=dict)
     rationale: str = ""
     stop: bool = False
     planner: str = ""
     note: str = ""
+    patches: Mapping[str, Sequence[Mapping[str, str]]] = field(default_factory=dict)
 
 
 class Planner(ABC):
@@ -55,6 +69,7 @@ def tools_from_evidence(evidence: Mapping[str, Any]) -> dict[str, Tool]:
                 tool["default"],
                 tool["description"],
                 tuple(tool["signals"]),
+                tool.get("requires", {}),
             )
             for tool in evidence["tools"]
         ]
@@ -62,15 +77,23 @@ def tools_from_evidence(evidence: Mapping[str, Any]) -> dict[str, Tool]:
 
 
 def _tried_options(
-    evidence: Mapping[str, Any], tools: Mapping[str, Tool]
+    evidence: Mapping[str, Any],
+    tools: Mapping[str, Tool],
+    parent: str | None = None,
 ) -> set[tuple[str, str]]:
-    """Options already explored: the baseline's values and every value a trial set."""
+    """Options already explored: the baseline's values and every value a trial set.
+
+    With ``parent``, only trials proposed from that incumbent count, so an
+    option judged under an earlier incumbent can be revisited.
+    """
     baseline = evidence["baseline"]["recipe"]
     tried = {
         (name, json.dumps(baseline.get(name, tool.default)))
         for name, tool in tools.items()
     }
     for trial in evidence.get("history", ()):
+        if parent is not None and trial.get("parent") != parent:
+            continue
         for name, value in trial.get("changes", {}).items():
             tried.add((name, json.dumps(value)))
     return tried
@@ -82,9 +105,11 @@ class HeuristicPlanner(Planner):
     The incumbent's strongest profile signal picks the first options to try:
     the tools that declare they relieve it. Then every other option is tried,
     runtime first, then engine, graph, workload and kernel tools, each value in
-    the order its tool lists. An option the baseline uses or any trial already
-    set is not proposed again, so promoted changes are never reverted; the
-    planner stops once every option has been tried.
+    the order its tool lists. The baseline's own options are never proposed,
+    so promoted changes are never reverted. Options are tried once in that
+    order; when none is left, an option rejected under an earlier incumbent is
+    revisited under the current one, since options interact. The planner stops
+    once every option has been tried under the current incumbent.
     """
 
     name = "heuristic"
@@ -93,8 +118,9 @@ class HeuristicPlanner(Planner):
         tools = tools_from_evidence(evidence)
         incumbent = evidence["incumbent"]
         recipe = incumbent["recipe"]
-        tried_recipes = set(evidence.get("tried", ()))
-        tried_options = _tried_options(evidence, tools)
+        tried_recipes = {digest(dict(r)) for r in evidence.get("tried", ())}
+        tried_anywhere = _tried_options(evidence, tools)
+        tried_here = _tried_options(evidence, tools, parent=incumbent.get("trial"))
         current = {name: recipe.get(name, tool.default) for name, tool in tools.items()}
 
         ordered: list[tuple[Tool, str]] = []
@@ -107,20 +133,35 @@ class HeuristicPlanner(Planner):
                 if tool.layer == layer:
                     ordered.append((tool, f"untried {layer}-layer option"))
 
-        for tool, reason in ordered:
-            for value in tool.values:
-                if is_member(value, (current[tool.name],)):
-                    continue
-                if (tool.name, json.dumps(value)) in tried_options:
-                    continue
-                candidate = apply(recipe, {tool.name: value}, tools)
-                if digest(candidate) in tried_recipes:
-                    continue
-                return Proposal(
-                    changes={tool.name: value},
-                    rationale=f"{reason} -> try {tool.name}={value!r}",
-                    planner=self.name,
-                )
+        for tried, prefix in (
+            (tried_anywhere, ""),
+            (tried_here, "revisit under the new incumbent: "),
+        ):
+            for tool, reason in ordered:
+                for value in tool.values:
+                    if is_member(value, (current[tool.name],)):
+                        continue
+                    if (tool.name, json.dumps(value)) in tried:
+                        continue
+                    # An option comes with the settings it requires.
+                    changes = {
+                        **unmet_requirements(current, tool.name, tools),
+                        tool.name: value,
+                    }
+                    candidate = apply(recipe, changes, tools)
+                    if digest(candidate) in tried_recipes:
+                        continue
+                    needs = "".join(
+                        f", with {name}={changes[name]!r}"
+                        for name in changes
+                        if name != tool.name
+                    )
+                    return Proposal(
+                        changes=changes,
+                        rationale=f"{prefix}{reason} -> try {tool.name}={value!r}"
+                        f"{needs}",
+                        planner=self.name,
+                    )
         return Proposal(
             stop=True,
             rationale="Every exposed option has been tried",
@@ -144,16 +185,31 @@ results yourself.
 
 Prefer the change that addresses the strongest measured bottleneck. Learn from
 the history: do not repeat a recipe that was already tried, and do not retry an
-option that failed for a reason the new experiment does not address. Explain in
-"rationale" which evidence motivates the experiment and what you expect.
-{instructions}
+option that failed for a reason the new experiment does not address. A tool's
+"requires" lists settings its non-default values need; the incumbent must
+already have them or the experiment must set them too. Explain in "rationale"
+which evidence motivates the experiment and what you expect.
+{patches}{instructions}
 EVIDENCE:
 {evidence}
 """
 
+_PATCH_PROMPT = """
+The workload also exposes source files you may edit ("patch_slots" in the
+EVIDENCE: each slot's description and its editable EVOLVE-BLOCK regions as they
+are in the incumbent). An experiment may change tools, patch slots, or both.
+A patch is a list of SEARCH/REPLACE edits: "search" must match the slot's
+current text exactly once inside its EVOLVE-BLOCK regions, and "replace" is the
+new text. The session refuses edits outside those regions, edits that change a
+fence line or empty a region, and files that do not compile; the evaluator
+checks accuracy against the reference and only measured gains count. Send an
+empty "patches" list when you change only tools. Keep patches small, focused
+and correct; equal speed with simpler code is better.
+"""
 
-def proposal_schema(max_changes: int) -> dict[str, Any]:
-    return {
+
+def proposal_schema(max_changes: int, slots: Sequence[str] = ()) -> dict[str, Any]:
+    schema: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
@@ -175,6 +231,35 @@ def proposal_schema(max_changes: int) -> dict[str, Any]:
         },
         "required": ["action", "changes", "rationale"],
     }
+    if slots:
+        schema["properties"]["patches"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "slot": {"type": "string", "enum": list(slots)},
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "search": {"type": "string"},
+                                "replace": {"type": "string"},
+                            },
+                            "required": ["search", "replace"],
+                        },
+                    },
+                },
+                "required": ["slot", "edits"],
+            },
+        }
+        # Strict structured output needs every property required; an empty
+        # list means no patch.
+        schema["required"].append("patches")
+    return schema
 
 
 class AgentPlanner(Planner):
@@ -225,13 +310,19 @@ class AgentPlanner(Planner):
 
     def prompt(self, evidence: Mapping[str, Any]) -> str:
         goal = evidence["goal"]
+        threshold = (evidence.get("noise") or {}).get("promotion_threshold")
+        brief = evidence.get("brief")
+        guidance = "\n\n".join(part for part in (brief, self.instructions) if part)
         return _PROMPT.format(
             max_changes=self.max_changes,
             metric=goal["metric"],
-            min_improvement=goal["min_improvement"],
+            min_improvement=(
+                threshold if threshold is not None else goal["min_improvement"]
+            ),
+            patches=_PATCH_PROMPT if evidence.get("patch_slots") else "",
             instructions=(
-                f"\nAdditional guidance from the user:\n{self.instructions}\n"
-                if self.instructions
+                f"\nAdditional guidance from the user:\n{guidance}\n"
+                if guidance
                 else ""
             ),
             evidence=json.dumps(evidence, indent=1, sort_keys=True, default=str),
@@ -247,7 +338,10 @@ class AgentPlanner(Planner):
                 prompt=self.prompt(evidence),
                 workdir=workdir,
                 timeout_s=self.timeout_s,
-                schema=proposal_schema(self.max_changes),
+                schema=proposal_schema(
+                    self.max_changes,
+                    [slot["name"] for slot in evidence.get("patch_slots", ())],
+                ),
                 evidence=dict(evidence),
             )
             return _proposal_from_reply(reply, self.name)
@@ -274,9 +368,28 @@ def _proposal_from_reply(reply: Mapping[str, Any], planner: str) -> Proposal:
         if not isinstance(change, Mapping) or "tool" not in change:
             raise ValueError(f"Planner reply has a malformed change: {change!r}")
         changes[str(change["tool"])] = change.get("value")
-    if not changes:
+    patches: dict[str, list[dict[str, str]]] = {}
+    for patch in reply.get("patches") or ():
+        if (
+            not isinstance(patch, Mapping)
+            or not isinstance(patch.get("slot"), str)
+            or not isinstance(patch.get("edits"), (list, tuple))
+        ):
+            raise ValueError(f"Planner reply has a malformed patch: {patch!r}")
+        edits = patches.setdefault(patch["slot"], [])
+        for edit in patch["edits"]:
+            if not (
+                isinstance(edit, Mapping)
+                and isinstance(edit.get("search"), str)
+                and isinstance(edit.get("replace"), str)
+            ):
+                raise ValueError(f"Planner reply has a malformed edit: {edit!r}")
+            edits.append({"search": edit["search"], "replace": edit["replace"]})
+    if not changes and not patches:
         raise ValueError("Planner reply proposes an experiment without changes")
-    return Proposal(changes=changes, rationale=rationale, planner=planner)
+    return Proposal(
+        changes=changes, rationale=rationale, planner=planner, patches=patches
+    )
 
 
 def planner_from_json(config: Mapping[str, Any]) -> Planner:
@@ -304,6 +417,6 @@ def validate_changes(
     if not proposal.changes:
         raise ValueError("The proposal changes nothing")
     for name in proposal.changes:
-        if name.partition(".")[0] not in LAYERS:
+        if not is_patch_key(name) and name.partition(".")[0] not in LAYERS:
             raise ValueError(f"Unknown tool {name!r}")
     return apply(recipe, proposal.changes, tools)

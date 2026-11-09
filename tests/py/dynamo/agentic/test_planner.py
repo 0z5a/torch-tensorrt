@@ -5,7 +5,6 @@ import json
 import os
 
 import pytest
-
 from torch_tensorrt.agentic import AgentPlanner, HeuristicPlanner, Proposal
 from torch_tensorrt.agentic._planner import (
     _proposal_from_reply,
@@ -13,7 +12,6 @@ from torch_tensorrt.agentic._planner import (
     proposal_schema,
     validate_changes,
 )
-from torch_tensorrt.agentic._spec import digest
 from torch_tensorrt.agentic._tools import apply, catalog
 from torch_tensorrt.dynamo.region_compilation._generation import _providers
 
@@ -33,7 +31,7 @@ def evidence(recipe=None, signals=(), history=(), baseline=None, tried=()):
             {**tool.to_json(), "current": recipe.get(name, tool.default)}
             for name, tool in TOOLS.items()
         ],
-        "tried": sorted({digest(baseline or {}), digest(recipe), *tried}),
+        "tried": [baseline or {}, recipe, *tried],
     }
 
 
@@ -82,6 +80,30 @@ def test_heuristic_planner_stops_when_every_option_was_tried(tmp_path):
     ]
     proposal = HeuristicPlanner().propose(evidence(history=history), tmp_path)
     assert proposal.stop and not proposal.changes
+
+
+def test_heuristic_planner_revisits_options_under_a_new_incumbent(tmp_path):
+    history = [
+        {"trial": "0001", "parent": "0000", "changes": {"runtime.cudagraphs": True}},
+        {"trial": "0002", "parent": "0000", "changes": {"engine.precision": "fp16"}},
+        {
+            "trial": "0003",
+            "parent": "0002",
+            "changes": {"engine.optimization_level": 5},
+        },
+        {"trial": "0004", "parent": "0002", "changes": {"workload.variant": "b"}},
+        {"trial": "0005", "parent": "0002", "changes": {"workload.variant": "c"}},
+    ]
+    found = evidence(recipe={"engine.precision": "fp16"}, history=history)
+    found["incumbent"]["trial"] = "0002"
+    proposal = HeuristicPlanner().propose(found, tmp_path)
+    # Every option was tried once; CUDA graphs only under the earlier incumbent.
+    assert proposal.changes == {"runtime.cudagraphs": True}
+    assert proposal.rationale.startswith("revisit under the new incumbent")
+    found["history"].append(
+        {"trial": "0006", "parent": "0002", "changes": {"runtime.cudagraphs": True}}
+    )
+    assert HeuristicPlanner().propose(found, tmp_path).stop
 
 
 ADAPTER = """
@@ -180,3 +202,82 @@ def test_planners_round_trip_through_json():
         planner_from_json({"kind": "custom"})
     with pytest.raises(ValueError, match="max_changes"):
         AgentPlanner(max_changes=0)
+
+
+def test_agent_replies_may_carry_code_patches():
+    schema = proposal_schema(2, ["kernels"])
+    assert schema["properties"]["patches"]["items"]["properties"]["slot"]["enum"] == [
+        "kernels"
+    ]
+    assert "patches" not in proposal_schema(2)["properties"]
+    proposal = _proposal_from_reply(
+        {
+            "action": "experiment",
+            "changes": [],
+            "patches": [
+                {"slot": "kernels", "edits": [{"search": "A", "replace": "B"}]}
+            ],
+            "rationale": "fuse the norm",
+        },
+        "agent",
+    )
+    assert proposal.patches == {"kernels": [{"search": "A", "replace": "B"}]}
+    assert not proposal.changes
+    with pytest.raises(ValueError, match="malformed patch"):
+        _proposal_from_reply(
+            {"action": "experiment", "changes": [], "patches": [{"slot": 1}]}, "agent"
+        )
+    prompt = AgentPlanner().prompt(
+        {
+            **evidence(),
+            "patch_slots": [{"name": "kernels"}],
+            "brief": "Go for fusion.",
+            "noise": {"promotion_threshold": 0.05},
+        }
+    )
+    assert "SEARCH/REPLACE" in prompt and "Go for fusion." in prompt
+    assert "by more than 5.0% beyond noise" in prompt
+
+
+def test_the_reply_schema_requires_every_property():
+    from torch_tensorrt.agentic._planner import proposal_schema
+
+    # Strict structured output (codex) needs every property listed as required.
+    for slots in ((), ("speed",)):
+        schema = proposal_schema(2, slots)
+        assert set(schema["required"]) == set(schema["properties"])
+    assert "patches" in proposal_schema(2, ("speed",))["required"]
+
+
+def test_heuristic_planner_proposes_an_option_with_what_it_requires(tmp_path):
+    from torch_tensorrt.agentic import Tool
+
+    tools = catalog(
+        [
+            Tool("runtime.cudagraphs", (False, True), False, "graphs"),
+            Tool("workload.cache", ("v2", "v3"), "v2", "cache"),
+            Tool(
+                "kernels.blocks",
+                ("", "fused"),
+                "",
+                "fused kernels",
+                ("roofline_gap",),
+                {"runtime.cudagraphs": True, "workload.cache": "v3"},
+            ),
+        ]
+    )
+    state = {
+        "goal": {"metric": "latency_ms", "min_improvement": 0.02, "target": None},
+        "baseline": {"recipe": {}},
+        "incumbent": {
+            "recipe": {"workload.cache": "v3"},
+            "signals": [signal("roofline_gap")],
+        },
+        "history": [],
+        "tools": [tool.to_json() for tool in tools.values()],
+        "tried": [{}, {"workload.cache": "v3"}],
+    }
+    proposal = HeuristicPlanner().propose(state, tmp_path)
+    # The requirement the incumbent lacks comes along; the one it has does not.
+    assert proposal.changes == {"kernels.blocks": "fused", "runtime.cudagraphs": True}
+    assert "with runtime.cudagraphs=True" in proposal.rationale

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -13,21 +14,32 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
+from torch_tensorrt.agentic._patches import (
+    PATCH_PREFIX,
+    PatchSlot,
+    PatchStore,
+    apply_edits,
+    check_source,
+    editable_blocks,
+    is_patch_key,
+)
 from torch_tensorrt.agentic._planner import (
     HeuristicPlanner,
     Planner,
+    Proposal,
     planner_from_json,
     validate_changes,
 )
-from torch_tensorrt.agentic._report import write_report
+from torch_tensorrt.agentic._report import write_ledger, write_report
 from torch_tensorrt.agentic._spec import (
     Budget,
     Constraints,
     Goal,
+    Measurement,
     Recipe,
     Timing,
     Workload,
@@ -70,6 +82,7 @@ class SessionResult:
     confirmation: dict[str, Any] | None
     artifact: Path | None
     report_path: Path
+    calibration: dict[str, Any] | None = None
 
     def report(self) -> str:
         return self.report_path.read_text()
@@ -108,16 +121,20 @@ class OptimizationSession:
     proposes changes to the best recipe so far, the session validates them
     against the workload's tools, and a fresh worker process builds, checks,
     measures and profiles the candidate. A candidate is promoted only if it
-    passes the accuracy and memory constraints and improves the goal metric by
-    more than ``goal.min_improvement`` with non-overlapping quartiles. The
+    passes the accuracy and memory constraints, its measurement is stable, and
+    it improves the goal metric by more than the noise threshold, first in its
+    own run and then in raced, interleaved incumbent/candidate pairs (see
+    :class:`~torch_tensorrt.agentic.Measurement`). The threshold is
+    ``goal.min_improvement`` or, if larger, a multiple of the spread between
+    fresh-process runs of the baseline measured when the session starts. The
     search stops at the goal's target, at the end of the budget, after
     ``budget.patience`` trials without a promotion, or when the planner stops.
 
     Finally the best candidate is confirmed against the baseline in
     ``confirm_repeats`` fresh baseline/best worker pairs run back to back; it
-    is kept only if the median paired gain still exceeds
-    ``goal.min_improvement``. The winner is exported to ``directory/artifact``
-    with its recipe and the report.
+    is kept only if the median paired gain still exceeds the threshold. The
+    winner is exported to ``directory/artifact`` with its recipe and the
+    report; ``ledger.tsv`` lists every trial as it is decided.
 
     Every step is recorded under ``directory``. Running a session again in the
     same directory resumes it: completed trials are reused, an interrupted
@@ -139,6 +156,8 @@ class OptimizationSession:
         export: bool = True,
         python: str | None = None,
         env: Mapping[str, str] | None = None,
+        measurement: Measurement | None = None,
+        brief: str | None = None,
     ) -> None:
         if not isinstance(workload, Workload):
             raise TypeError(
@@ -159,6 +178,11 @@ class OptimizationSession:
         self.python = python or sys.executable
         self.env = dict(env or {})
         self.cwd = os.getcwd()
+        self.measurement = measurement or Measurement()
+        self.brief = brief
+        # Set from the calibration once the baseline is known.
+        self.threshold = self.goal.min_improvement
+        self.noise: float | None = None
 
     # ----------------------------------------------------------------- setup
 
@@ -192,6 +216,11 @@ class OptimizationSession:
             confirm_repeats=config["confirm_repeats"],
             export=config["export"],
             python=config.get("python"),
+            measurement=(
+                Measurement(**config["measurement"])
+                if config.get("measurement")
+                else None
+            ),
         )
         session.cwd = config.get("cwd", session.cwd)
         return session
@@ -233,9 +262,83 @@ class OptimizationSession:
             export=self.export,
             python=self.python,
             cwd=self.cwd,
+            measurement=asdict(self.measurement),
         )
+        if self.brief is not None:
+            # program.md starts as the brief and may be edited between resumes;
+            # it is replaced only when a different brief is passed.
+            program = self.directory / "program.md"
+            sha = hashlib.sha256(self.brief.encode()).hexdigest()
+            if not program.is_file() or config.get("brief_sha256") != sha:
+                program.write_text(self.brief)
+            elif program.read_text() != self.brief:
+                logger.info("Keeping the edited %s", program)
+            config["brief_sha256"] = sha
         write_json(path, config)
         return config
+
+    def _apply_patches(
+        self,
+        proposal: Proposal,
+        recipe: Mapping[str, Any],
+        slots: Mapping[str, PatchSlot],
+    ) -> dict[str, str]:
+        """Apply the proposal's edits to the incumbent's sources; store each new file.
+
+        Returns the recipe changes (``patch.<slot>`` -> digest, or ``""`` for
+        the original file). Raises ValueError for an unknown slot, an edit
+        outside the fences, a file that does not compile, a patch that changes
+        nothing, or a ``patch.<slot>`` change naming no stored patch.
+        """
+        store = PatchStore(self.directory)
+        for key, value in proposal.changes.items():
+            if not is_patch_key(key):
+                continue
+            if key[len(PATCH_PREFIX) :] not in slots:
+                raise ValueError(
+                    f"Unknown patch slot {key!r}; the workload has "
+                    f"{sorted(slot.key for slot in slots.values())}"
+                )
+            if value and not store.path(value).is_file():
+                raise ValueError(f"{key} names no stored patch: {value!r}")
+        changes = {}
+        for name, edits in proposal.patches.items():
+            slot = slots.get(name)
+            if slot is None:
+                raise ValueError(
+                    f"Unknown patch slot {name!r}; the workload has {sorted(slots)}"
+                )
+            source = store.source(slot, recipe)
+            patched = apply_edits(source, edits)
+            if patched == source:
+                raise ValueError(f"the patch of {name} changes nothing")
+            check_source(patched, slot.path)
+            # Edits that restore the original file select the original.
+            original = Path(slot.path).read_text()
+            changes[slot.key] = "" if patched == original else store.save(patched)
+        return changes
+
+    def _measurement_request(self) -> dict[str, Any]:
+        return {
+            "quiet_gpu_s": self.measurement.quiet_gpu_s,
+            "retries": self.measurement.retries,
+            "max_spread": self.measurement.max_spread,
+        }
+
+    def _measure(
+        self, recipe: Recipe, timing: Timing, directory: Path, *, profile: bool = False
+    ) -> dict[str, Any]:
+        """One fresh-process measurement of ``recipe``."""
+        return self._run_worker(
+            {
+                "kind": "trial",
+                "recipe": recipe,
+                "timing": asdict(timing),
+                "profile": profile,
+                "measurement": self._measurement_request(),
+            },
+            directory,
+        )
 
     def _event(self, event: str, **fields: Any) -> None:
         line = json.dumps({"time": time.time(), "event": event, **fields}, default=str)
@@ -254,6 +357,7 @@ class OptimizationSession:
             "workload": self.workload.to_json(),
             "reference_path": str(self.directory / "reference.pt"),
             "result_path": str(result_path),
+            "patch_dir": str(self.directory),
         }
         write_json(directory / "request.json", request)
         return self._execute(request, directory)
@@ -350,15 +454,7 @@ class OptimizationSession:
         directory = self._trial_dir(number)
         write_json(directory / "trial.json", record)
         self._event("trial", trial=record["id"], changes=record.get("changes"))
-        return self._run_worker(
-            {
-                "kind": "trial",
-                "recipe": record["recipe"],
-                "timing": asdict(timing),
-                "profile": True,
-            },
-            directory,
-        )
+        return self._measure(record["recipe"], timing, directory, profile=True)
 
     def judge(
         self,
@@ -366,7 +462,13 @@ class OptimizationSession:
         incumbent: Mapping[str, Any] | None,
         bounds: Mapping[str, tuple[str, float]],
     ) -> tuple[bool, str]:
-        """Whether ``result`` qualifies, and replaces ``incumbent`` if one is given."""
+        """Whether ``result`` qualifies, and (from its own run) beats ``incumbent``.
+
+        A qualifying result passed, met the accuracy and memory constraints
+        and was measured stably. Beating the incumbent takes a gain above the
+        noise threshold; with racing on, the session then confirms it in
+        paired runs before promoting.
+        """
         if result.get("status") != "ok":
             error = str(result.get("error", "")).strip().splitlines()
             return False, f"{result.get('stage')} failed: {error[-1] if error else '?'}"
@@ -380,21 +482,198 @@ class OptimizationSession:
         limit = self.constraints.max_memory_mb
         if limit is not None and (memory is None or memory > limit):
             return False, f"memory {memory} MB exceeds max_memory_mb={limit:g}"
+        measurement = result.get("measurement") or {}
+        if measurement.get("stable") is False:
+            spreads = measurement.get("spreads") or [float("nan")]
+            busy = ", the GPU was busy" if measurement.get("gpu_quiet") is False else ""
+            return False, (
+                f"unstable measurement: interquartile spread {spreads[-1]:.1%} after "
+                f"{len(spreads)} attempts{busy}"
+            )
         if incumbent is None:
             return True, "validated baseline"
         value = metric_value(result, self.goal)
         best = metric_value(incumbent, self.goal)
         gain = self.goal.gain(best, value)
-        if gain > self.goal.min_improvement and _separated(result, incumbent):
+        racing = self.measurement.race_pairs > 0
+        if gain > self.threshold and (racing or _separated(result, incumbent)):
             return (
                 True,
                 f"{self.goal.metric} improved {gain:+.1%} ({best:.4g} -> {value:.4g})",
             )
+        needs = f"needs more than {self.threshold:.1%}" + (
+            "" if racing else " with non-overlapping quartiles"
+        )
         return False, (
             f"no gain beyond noise: {self.goal.metric} {gain:+.1%} ({best:.4g} -> "
-            f"{value:.4g}); needs more than {self.goal.min_improvement:.1%} with "
-            "non-overlapping quartiles"
+            f"{value:.4g}); {needs}"
         )
+
+    def _decide(
+        self,
+        number: int,
+        record: dict[str, Any],
+        incumbent: dict[str, Any],
+        timing: Timing,
+        bounds: Mapping[str, tuple[str, float]],
+    ) -> dict[str, Any]:
+        """Judge a measured trial, racing it against the incumbent if it looks better."""
+        accepted, reason = self.judge(record["result"], incumbent["result"], bounds)
+        if not (accepted and self.measurement.race_pairs):
+            return {
+                "decision": "promoted" if accepted else "rejected",
+                "reason": reason,
+            }
+        race = self._paired(
+            incumbent,
+            record,
+            timing,
+            bounds,
+            self._trial_dir(number) / "race",
+            self.measurement.race_pairs,
+            ("incumbent", "candidate"),
+        )
+        gain = race["median_gain"]
+        if race["confirmed"]:
+            verdict = (
+                f"raced: median paired gain {gain:+.1%} over "
+                f"{len(race['gains'])} interleaved pairs (threshold {self.threshold:.1%})"
+            )
+        elif race["problems"]:
+            verdict = "race failed: " + "; ".join(race["problems"])
+        else:
+            gains = ", ".join(f"{g:+.1%}" for g in race["gains"])
+            verdict = (
+                f"not confirmed in paired runs: gains {gains} (every pair must gain "
+                f"and the median must exceed {self.threshold:.1%})"
+            )
+        return {
+            "decision": "promoted" if race["confirmed"] else "rejected",
+            "reason": verdict,
+            "screen": reason,
+            "race": race,
+        }
+
+    def _paired(
+        self,
+        reference: dict[str, Any],
+        candidate: dict[str, Any],
+        timing: Timing,
+        bounds: Mapping[str, tuple[str, float]],
+        directory: Path,
+        pairs: int,
+        arms: tuple[str, str],
+    ) -> dict[str, Any]:
+        """Measure ``reference`` and ``candidate`` in fresh back-to-back pairs.
+
+        The order alternates between pairs, so a drift (warming clocks, a
+        neighbour job starting) does not favour one side. The candidate is
+        confirmed when every run qualifies, every pair shows a gain and the
+        median gain exceeds the threshold.
+        """
+        first, second = arms
+        runs = []
+        for index in range(pairs):
+            order = [(first, reference), (second, candidate)]
+            if index % 2:
+                order.reverse()
+            pair = {
+                arm: self._measure(
+                    record["recipe"], timing, directory / f"{index}-{arm}"
+                )
+                for arm, record in order
+            }
+            runs.append(pair)
+        gains, problems = [], []
+        for index, pair in enumerate(runs):
+            for arm in arms:
+                accepted, reason = self.judge(pair[arm], None, bounds)
+                if not accepted:
+                    problems.append(f"pair {index} {arm}: {reason}")
+            if pair[first].get("status") == "ok" and pair[second].get("status") == "ok":
+                gains.append(
+                    self.goal.gain(
+                        metric_value(pair[first], self.goal),
+                        metric_value(pair[second], self.goal),
+                    )
+                )
+        median = statistics.median(gains) if gains else None
+        confirmed = bool(
+            not problems
+            and gains
+            and min(gains) > 0
+            and median is not None
+            and median > self.threshold
+        )
+        return {
+            "confirmed": confirmed,
+            "median_gain": median,
+            "gains": gains,
+            "problems": problems,
+            "threshold": self.threshold,
+            "pairs": [
+                {arm: _short(result, self.goal) for arm, result in pair.items()}
+                for pair in runs
+            ],
+        }
+
+    def _calibrate(
+        self,
+        baseline: dict[str, Any],
+        timing: Timing,
+        bounds: Mapping[str, tuple[str, float]],
+    ) -> dict[str, Any]:
+        """A/A test: how much the baseline's metric moves between fresh processes.
+
+        Sets the promotion threshold to ``goal.min_improvement`` or
+        ``measurement.noise_factor`` times that spread, whichever is larger.
+        A resumed session reuses its calibration if it was made with the same
+        number of runs and measured a spread.
+        """
+        path = self.directory / "calibration" / "summary.json"
+        requested = self.measurement.calibration_runs
+        summary: dict[str, Any] = json.loads(path.read_text()) if path.is_file() else {}
+        if summary.get("requested") != requested or (
+            requested and summary.get("spread") is None
+        ):
+            values = [metric_value(baseline["result"], self.goal)]
+            runs = []
+            for index in range(self.measurement.calibration_runs):
+                result = self._measure(
+                    baseline["recipe"],
+                    timing,
+                    self.directory / "calibration" / str(index),
+                )
+                accepted, reason = self.judge(result, None, bounds)
+                runs.append({"accepted": accepted, "reason": reason})
+                if accepted:
+                    values.append(metric_value(result, self.goal))
+            spread = (
+                (max(values) - min(values)) / statistics.median(values)
+                if len(values) > 1
+                else None
+            )
+            summary = {
+                "requested": requested,
+                "metrics": values,
+                "spread": spread,
+                "runs": runs,
+            }
+            if requested and spread is None:
+                logger.warning(
+                    "No calibration run was accepted, so the promotion threshold "
+                    "is the goal's min_improvement; see %s",
+                    path.parent,
+                )
+        self.noise = summary["spread"]
+        self.threshold = max(
+            self.goal.min_improvement,
+            self.measurement.noise_factor * (self.noise or 0.0),
+        )
+        summary["threshold"] = self.threshold
+        write_json(path, summary)
+        self._event("calibration", spread=self.noise, threshold=self.threshold)
+        return summary
 
     # -------------------------------------------------------------- evidence
 
@@ -419,7 +698,7 @@ class OptimizationSession:
             )
         else:
             summary.update(stage=result.get("stage"), error=result.get("error"))
-        for key in ("structure", "profile", "signals"):
+        for key in ("structure", "profile", "signals", "roofline", "measurement"):
             if key in result:
                 summary[key] = result[key]
         return summary
@@ -432,6 +711,7 @@ class OptimizationSession:
         bounds: Mapping[str, tuple[str, float]],
         used: int,
         elapsed_s: float,
+        slots: Mapping[str, PatchSlot] | None = None,
     ) -> dict[str, Any]:
         history = []
         for record in trials[1:]:
@@ -448,13 +728,21 @@ class OptimizationSession:
             if result.get("status") == "ok":
                 entry["metric"] = metric_value(result, self.goal)
                 entry["signals"] = [s["signal"] for s in result.get("signals", ())]
+                race = record.get("decision", {}).get("race")
+                if race:
+                    entry["paired_gains"] = race.get("gains")
             elif result:
                 entry["stage"] = result.get("stage")
                 entry["error"] = str(result.get("error", ""))[-500:]
             history.append(entry)
         current = incumbent["recipe"]
-        return {
+        evidence: dict[str, Any] = {
             "goal": asdict(self.goal),
+            "noise": {
+                "between_process_spread": self.noise,
+                "promotion_threshold": self.threshold,
+                "race_pairs": self.measurement.race_pairs,
+            },
             "constraints": {
                 "accuracy": {name: list(bound) for name, bound in bounds.items()},
                 "max_memory_mb": self.constraints.max_memory_mb,
@@ -478,8 +766,27 @@ class OptimizationSession:
                 {**tool.to_json(), "current": current.get(name, tool.default)}
                 for name, tool in tools.items()
             ],
-            "tried": sorted(record["digest"] for record in trials),
+            # Readable for the planner; the session itself de-duplicates by digest.
+            "tried": [
+                record["recipe"]
+                for record in trials
+                if record.get("decision", {}).get("decision") != "invalid"
+            ],
         }
+        store = PatchStore(self.directory)
+        if slots:
+            evidence["patch_slots"] = [
+                {
+                    **slot.to_json(),
+                    "patched": current.get(slot.key),
+                    "editable_blocks": editable_blocks(store.source(slot, current)),
+                }
+                for slot in slots.values()
+            ]
+        brief = self.directory / "program.md"
+        if brief.is_file():
+            evidence["brief"] = brief.read_text()[:20000]
+        return evidence
 
     # ------------------------------------------------------------------- run
 
@@ -510,6 +817,10 @@ class OptimizationSession:
                     f"directory ({key} was {config[key]}, now {prepared[key]})"
                 )
             config[key] = prepared[key]
+        slots = {
+            slot["name"]: PatchSlot.from_json(slot)
+            for slot in case.get("patch_slots", ())
+        }
         timing = self.timing or Timing(**case["timing"])
         bounds = self.constraints.bounds(
             {name: tuple(bound) for name, bound in case["accuracy_defaults"].items()}
@@ -541,6 +852,8 @@ class OptimizationSession:
                 f"The baseline is not valid, so nothing can be compared with it: "
                 f"{baseline['decision']['reason']}. See {self._trial_dir(0)}/worker.log"
             )
+        calibration = self._calibrate(baseline, timing, bounds)
+        checkpoint()
 
         # Replay recorded decisions; evaluate an interrupted trial again.
         incumbent = baseline
@@ -548,13 +861,9 @@ class OptimizationSession:
         for number, record in enumerate(trials[1:], start=1):
             if "decision" not in record:
                 record["result"] = self._evaluate(number, record, timing)
-                accepted, reason = self.judge(
-                    record["result"], incumbent["result"], bounds
+                record["decision"] = self._decide(
+                    number, record, incumbent, timing, bounds
                 )
-                record["decision"] = {
-                    "decision": "promoted" if accepted else "rejected",
-                    "reason": reason,
-                }
                 write_json(
                     self._trial_dir(number) / "decision.json", record["decision"]
                 )
@@ -568,6 +877,9 @@ class OptimizationSession:
                 incumbent, stale = record, 0
             else:
                 stale += 1
+        # A resumed run (perhaps with an edited program.md) gets a fresh count
+        # of consecutive invalid proposals.
+        invalid = 0
 
         stop_reason = ""
         while not stop_reason:
@@ -589,7 +901,9 @@ class OptimizationSession:
 
             number = len(trials)
             directory = self._trial_dir(number)
-            evidence = self._evidence(tools, trials, incumbent, bounds, used, elapsed())
+            evidence = self._evidence(
+                tools, trials, incumbent, bounds, used, elapsed(), slots
+            )
             write_json(directory / "evidence.json", evidence)
             proposal = self.planner.propose(evidence, directory / "planner")
             proposal_json = {
@@ -598,6 +912,9 @@ class OptimizationSession:
                 "stop": proposal.stop,
                 "planner": proposal.planner or self.planner.name,
                 "note": proposal.note,
+                "patches": {
+                    name: list(edits) for name, edits in proposal.patches.items()
+                },
             }
             write_json(directory / "proposal.json", proposal_json)
             if proposal.stop:
@@ -610,7 +927,12 @@ class OptimizationSession:
                 "proposal": proposal_json,
             }
             try:
-                recipe = validate_changes(proposal, incumbent["recipe"], tools)
+                patched = self._apply_patches(proposal, incumbent["recipe"], slots)
+                recipe = validate_changes(
+                    replace(proposal, changes={**proposal.changes, **patched}),
+                    incumbent["recipe"],
+                    tools,
+                )
                 if digest(recipe) in {r["digest"] for r in trials}:
                     raise ValueError("this recipe was already evaluated")
             except ValueError as error:
@@ -627,6 +949,7 @@ class OptimizationSession:
                 write_json(directory / "decision.json", record["decision"])
                 trials.append(record)
                 invalid += 1
+                write_ledger(self.directory, trials, self.goal)
                 checkpoint()
                 continue
             invalid = 0
@@ -636,25 +959,28 @@ class OptimizationSession:
                 digest=digest(recipe),
             )
             record["result"] = self._evaluate(number, record, timing)
-            accepted, reason = self.judge(record["result"], incumbent["result"], bounds)
-            record["decision"] = {
-                "decision": "promoted" if accepted else "rejected",
-                "reason": reason,
-            }
+            record["decision"] = self._decide(number, record, incumbent, timing, bounds)
             write_json(directory / "decision.json", record["decision"])
-            self._event("decision", trial=record["id"], **record["decision"])
+            self._event(
+                "decision",
+                trial=record["id"],
+                decision=record["decision"]["decision"],
+                reason=record["decision"]["reason"],
+            )
             trials.append(record)
             used += 1
-            if accepted:
+            if record["decision"]["decision"] == "promoted":
                 incumbent, stale = record, 0
             else:
                 stale += 1
+            write_ledger(self.directory, trials, self.goal)
             checkpoint()
 
         confirmation = self._confirm(baseline, incumbent, timing, bounds)
         winner = incumbent if confirmation and confirmation["confirmed"] else baseline
         decision = "promoted" if winner is not baseline else "baseline retained"
         artifact = self._export(winner, timing) if self.export else None
+        write_ledger(self.directory, trials, self.goal)
         checkpoint()
         report_path = write_report(
             self.directory,
@@ -671,6 +997,7 @@ class OptimizationSession:
             environment=config.get("environment"),
             planner=self.planner.to_json(),
             elapsed_s=elapsed(),
+            calibration=calibration,
         )
         self._event("finished", decision=decision, winner=winner["id"])
         return SessionResult(
@@ -683,6 +1010,7 @@ class OptimizationSession:
             confirmation=confirmation,
             artifact=artifact,
             report_path=report_path,
+            calibration=calibration,
         )
 
     # ------------------------------------------------------------- finishing
@@ -697,53 +1025,21 @@ class OptimizationSession:
         """Measure baseline and best again in fresh, back-to-back worker pairs."""
         if best is baseline:
             return None
-        pairs = []
-        for repeat in range(self.confirm_repeats):
-            pair: dict[str, Any] = {}
-            for arm, record in (("baseline", baseline), ("best", best)):
-                directory = self.directory / "confirm" / f"{repeat}-{arm}"
-                pair[arm] = self._run_worker(
-                    {
-                        "kind": "trial",
-                        "recipe": record["recipe"],
-                        "timing": asdict(timing),
-                        "profile": False,
-                    },
-                    directory,
-                )
-            pairs.append(pair)
-        gains, problems = [], []
-        for index, pair in enumerate(pairs):
-            for arm in ("baseline", "best"):
-                accepted, reason = self.judge(pair[arm], None, bounds)
-                if not accepted:
-                    problems.append(f"pair {index} {arm}: {reason}")
-            if (
-                pair["baseline"].get("status") == "ok"
-                and pair["best"].get("status") == "ok"
-            ):
-                gains.append(
-                    self.goal.gain(
-                        metric_value(pair["baseline"], self.goal),
-                        metric_value(pair["best"], self.goal),
-                    )
-                )
-        gain = statistics.median(gains) if gains else None
-        confirmed = (
-            not problems and gain is not None and gain > self.goal.min_improvement
+        confirmation = self._paired(
+            baseline,
+            best,
+            timing,
+            bounds,
+            self.directory / "confirm",
+            self.confirm_repeats,
+            ("baseline", "best"),
         )
-        confirmation = {
-            "confirmed": confirmed,
-            "median_gain": gain,
-            "gains": gains,
-            "problems": problems,
-            "pairs": [
-                {arm: _short(result, self.goal) for arm, result in pair.items()}
-                for pair in pairs
-            ],
-        }
         write_json(self.directory / "confirm" / "summary.json", confirmation)
-        self._event("confirmation", confirmed=confirmed, median_gain=gain)
+        self._event(
+            "confirmation",
+            confirmed=confirmation["confirmed"],
+            median_gain=confirmation["median_gain"],
+        )
         return confirmation
 
     def _export(self, winner: dict[str, Any], timing: Timing) -> Path | None:
@@ -789,6 +1085,7 @@ def _tool_args(tool: Mapping[str, Any]) -> dict[str, Any]:
         "default": tool["default"],
         "description": tool["description"],
         "signals": tuple(tool["signals"]),
+        "requires": tool.get("requires", {}),
     }
 
 

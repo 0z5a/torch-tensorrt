@@ -23,6 +23,7 @@ from torch_tensorrt.agentic._case import (
     compare_outputs,
     describe_module,
 )
+from torch_tensorrt.agentic._patches import PatchSlot, load_module
 from torch_tensorrt.agentic._planner import (
     AgentPlanner,
     HeuristicPlanner,
@@ -34,7 +35,14 @@ from torch_tensorrt.agentic._session import (
     SessionError,
     SessionResult,
 )
-from torch_tensorrt.agentic._spec import Budget, Constraints, Goal, Timing, Workload
+from torch_tensorrt.agentic._spec import (
+    Budget,
+    Constraints,
+    Goal,
+    Measurement,
+    Timing,
+    Workload,
+)
 from torch_tensorrt.agentic._tools import GENERIC_TOOLS, Tool
 
 __all__ = [
@@ -46,8 +54,10 @@ __all__ = [
     "GENERIC_TOOLS",
     "Goal",
     "HeuristicPlanner",
+    "Measurement",
     "ModuleCase",
     "OptimizationSession",
+    "PatchSlot",
     "Planner",
     "Proposal",
     "SessionError",
@@ -57,4 +67,5 @@ __all__ = [
     "Workload",
     "compare_outputs",
     "describe_module",
+    "load_module",
 ]

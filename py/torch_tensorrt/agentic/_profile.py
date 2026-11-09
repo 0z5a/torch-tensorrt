@@ -15,6 +15,10 @@ import torch
 # for the search; every change is still judged by whole-workload measurement.
 LAUNCH_OVERHEAD_FRACTION = 0.2
 DOMINANT_KERNEL_SHARE = 0.35
+# Below this fraction of the memory-bandwidth floor a memory-bound workload
+# has room for better kernels or fewer bytes.
+ROOFLINE_FRACTION = 0.8
+COPY_SHARE = 0.03
 _TOP_KERNELS = 8
 
 
@@ -43,7 +47,7 @@ def profile_calls(
         traced_s = time.perf_counter() - start
     per_unit = max(calls * units, 1)
     kernels: dict[str, list[float]] = defaultdict(lambda: [0.0, 0])
-    device_us = 0.0
+    device_us = copy_us = 0.0
     launches = syncs = 0
     for event in profiler.events():
         if event.device_type != torch.autograd.DeviceType.CUDA:
@@ -56,6 +60,7 @@ def profile_calls(
         name = event.name
         if name.startswith("Memcpy") or name.startswith("Memset"):
             syncs += int("DtoH" in name)
+            copy_us += duration
         else:
             launches += 1
         kernels[name][0] += duration
@@ -71,6 +76,7 @@ def profile_calls(
         ),
         "kernels": launches / per_unit,
         "host_syncs": syncs / per_unit,
+        "copy_ms": copy_us / 1e3 / per_unit,
         "top_kernels": [
             {
                 "name": name if len(name) <= 120 else name[:117] + "...",
@@ -87,6 +93,7 @@ def signals(
     profile: Mapping[str, Any] | None,
     structure: Mapping[str, Any],
     values: Mapping[str, Any],
+    roofline: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Bottleneck signals, strongest first.
 
@@ -94,7 +101,36 @@ def signals(
     the mapping from signal to layer follows the session's four layers.
     """
     found: list[dict[str, Any]] = []
+    if roofline and roofline.get("fraction") is not None:
+        fraction = float(roofline["fraction"])
+        if fraction < ROOFLINE_FRACTION:
+            found.append(
+                {
+                    "signal": "roofline_gap",
+                    "strength": min(1.0, 1.0 - fraction),
+                    "detail": (
+                        f"it runs at {fraction:.0%} of memory-bandwidth-bound speed: "
+                        f"its latency is {1.0 / fraction:.2g}x the floor of "
+                        f"{roofline['floor_ms']:.3g} ms "
+                        f"({roofline['bytes_per_unit'] / 1e9:.3g} GB per unit at "
+                        f"{roofline['peak_read_gbps']:.0f} GB/s)"
+                    ),
+                }
+            )
     if profile:
+        copies = float(profile.get("copy_ms", 0.0))
+        device = float(profile.get("device_ms", 0.0))
+        if device > 0 and copies / device >= COPY_SHARE:
+            found.append(
+                {
+                    "signal": "copy_overhead",
+                    "strength": min(1.0, copies / device * 5),
+                    "detail": (
+                        f"{copies / device:.0%} of GPU time is memory copies "
+                        f"({copies:.3g} ms per unit)"
+                    ),
+                }
+            )
         overhead = float(profile.get("host_overhead_fraction", 0.0))
         if overhead >= LAUNCH_OVERHEAD_FRACTION:
             found.append(

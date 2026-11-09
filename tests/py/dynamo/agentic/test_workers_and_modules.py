@@ -6,9 +6,14 @@ from pathlib import Path
 
 import pytest
 import torch
-
 import torch_tensorrt
-from torch_tensorrt.agentic import Budget, OptimizationSession, Timing, Workload
+from torch_tensorrt.agentic import (
+    Budget,
+    Measurement,
+    OptimizationSession,
+    Timing,
+    Workload,
+)
 from torch_tensorrt.agentic._evaluator import evaluate
 from torch_tensorrt.agentic._tools import catalog, resolve
 
@@ -103,6 +108,12 @@ def test_a_session_runs_end_to_end_in_worker_processes(tmp_path):
         directory=tmp_path / "mlp",
         budget=Budget(max_trials=2, trial_timeout_s=900),
         confirm_repeats=1,
+        # One calibration run and one race pair exercise both through real
+        # workers. Other tests may share the GPU, so the session neither waits
+        # for an idle GPU nor holds this tiny model's jitter to 3%.
+        measurement=Measurement(
+            calibration_runs=1, race_pairs=1, quiet_gpu_s=0, max_spread=0.5
+        ),
     )
     result = session.run()
     trials = sorted((tmp_path / "mlp" / "trials").iterdir())
@@ -209,3 +220,15 @@ def test_region_tools_generate_kernels_through_the_kernel_generator(
     assert len(requests) == 1 and "aten.relu" in requests[0]["prompt"]
     # The user's module is not rewritten.
     assert "forward" not in vars(case.module.act)
+
+
+@requires_cuda
+def test_roofline_compares_latency_with_the_bandwidth_floor():
+    from torch_tensorrt.agentic._evaluator import peak_read_gbps, roofline
+
+    peak = peak_read_gbps()
+    assert 50 < peak < 50000
+    # Bytes that take exactly 1 ms at the measured peak, timed at 2 ms.
+    line = roofline(peak * 1e6, 2.0)
+    assert line["floor_ms"] == pytest.approx(1.0)
+    assert line["fraction"] == pytest.approx(0.5)

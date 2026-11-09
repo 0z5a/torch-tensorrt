@@ -83,6 +83,7 @@ def write_report(
     environment: Mapping[str, Any] | None,
     planner: Mapping[str, Any],
     elapsed_s: float,
+    calibration: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write ``report.md`` and ``report.json`` in ``directory``; return the Markdown path."""
     before, after = baseline["result"], winner["result"]
@@ -98,6 +99,18 @@ def write_report(
             else "baseline retained (no candidate was promoted)"
         )
     )
+    threshold = (calibration or {}).get("threshold", goal.min_improvement)
+    spread = (calibration or {}).get("spread")
+    noise = (
+        f" (goal {goal.min_improvement:.1%}; the baseline moved {spread:.2%} across "
+        f"{len((calibration or {}).get('metrics', []))} fresh-process runs)"
+        if spread is not None
+        else (
+            " (the calibration accepted no run, so the noise is unmeasured)"
+            if (calibration or {}).get("requested")
+            else ""
+        )
+    )
     lines = [
         f"# Optimization session report: {directory.name}",
         "",
@@ -105,8 +118,7 @@ def write_report(
         "",
         f"- Goal: {'minimize' if lower else 'maximize'} `{goal.metric}`"
         + (f", target {goal.target:g}" if goal.target else "")
-        + f"; a candidate must improve it by more than {goal.min_improvement:.1%} "
-        "with non-overlapping quartiles",
+        + f"; a candidate must improve it by more than {threshold:.1%}{noise}",
         "- Accuracy bounds: "
         + ", ".join(f"`{name} {op} {value:g}`" for name, (op, value) in bounds.items()),
         f"- Planner: `{json.dumps(dict(planner), sort_keys=True)}`",
@@ -161,6 +173,17 @@ def write_report(
     lines.append(
         f"| build s | {_number(before.get('build_s'))} | {_number(after.get('build_s'))} | |"
     )
+    line_b, line_a = before.get("roofline") or {}, after.get("roofline") or {}
+    if line_b or line_a:
+        floor = line_a.get("floor_ms") or line_b.get("floor_ms")
+        lines.append(
+            f"| speed vs. the memory-bandwidth floor ({_number(floor)} ms/unit) | "
+            + " | ".join(
+                f"{line['fraction']:.0%}" if line.get("fraction") else "-"
+                for line in (line_b, line_a)
+            )
+            + " | |"
+        )
     lines.append("")
     if confirmation:
         gains = ", ".join(f"{gain:+.1%}" for gain in confirmation["gains"])
@@ -235,6 +258,7 @@ def write_report(
         },
         "changes": changes,
         "confirmation": confirmation,
+        "calibration": dict(calibration) if calibration else None,
         "artifact": str(artifact) if artifact else None,
         "environment": dict(environment or {}),
         "planner": dict(planner),
@@ -257,3 +281,62 @@ def write_report(
         json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n"
     )
     return report_path
+
+
+_LEDGER_COLUMNS = (
+    "trial",
+    "parent",
+    "decision",
+    "metric",
+    "paired_gain",
+    "roofline",
+    "accuracy",
+    "build_s",
+    "changes",
+    "reason",
+)
+
+
+def write_ledger(directory: Path, trials: list[dict[str, Any]], goal: Goal) -> Path:
+    """Write ``ledger.tsv``: one line per decided trial, for people and planners."""
+    rows = ["\t".join(_LEDGER_COLUMNS)]
+    for trial in trials:
+        decision = trial.get("decision")
+        if not decision:
+            continue
+        result = trial.get("result") or {}
+        ok = result.get("status") == "ok"
+        race = decision.get("race") or {}
+        roofline = result.get("roofline") or {}
+        metric = (
+            result["throughput"]
+            if ok and goal.metric == "throughput"
+            else (result["latency_ms"]["median"] if ok else None)
+        )
+        fields = {
+            "trial": trial["id"],
+            "parent": trial.get("parent") or "",
+            "decision": decision["decision"],
+            "metric": _number(metric) if metric is not None else "",
+            "paired_gain": (
+                f"{race['median_gain']:+.2%}"
+                if race.get("median_gain") is not None
+                else ""
+            ),
+            "roofline": (
+                f"{roofline['fraction']:.0%}" if roofline.get("fraction") else ""
+            ),
+            "accuracy": ";".join(
+                f"{name}={_number(value, 4)}"
+                for name, value in sorted((result.get("accuracy") or {}).items())
+            ),
+            "build_s": _number(result.get("build_s"), 3) if ok else "",
+            "changes": json.dumps(trial.get("changes") or {}, sort_keys=True),
+            "reason": " ".join(str(decision.get("reason", "")).split())[:200],
+        }
+        rows.append(
+            "\t".join(fields[column].replace("\t", " ") for column in _LEDGER_COLUMNS)
+        )
+    path = directory / "ledger.tsv"
+    path.write_text("\n".join(rows) + "\n")
+    return path
